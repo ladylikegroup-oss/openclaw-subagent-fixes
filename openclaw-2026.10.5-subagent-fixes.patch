@@ -1,0 +1,2132 @@
+diff --git a/src/agents/agent-command-recovery-owner.ts b/src/agents/agent-command-recovery-owner.ts
+index 1f5c46e3fc472b360b870bbbc19e3698d6bf1490..1b244a192bf599c9ccc30384403f0f0a95e22193 100644
+--- a/src/agents/agent-command-recovery-owner.ts
++++ b/src/agents/agent-command-recovery-owner.ts
+@@ -272,6 +272,16 @@ export async function runWithAgentCommandRecoveryOwner<
+           releaseCommandAdmission();
+           continue;
+         }
++        // A reply owns the session before its durable execution fence is written.
++        // Keep command FIFO custody while waiting; a missing fence is not idleness.
++        if (
++          pendingReply &&
++          params.opts.sessionEffects !== "internal" &&
++          params.opts.mainRestartRecoveryAdmitted !== true
++        ) {
++          pendingOwner = pendingReply;
++          continue;
++        }
+         acquired = await claimAgentCommandRecoveryOwner({ ...params, prepared });
+       } catch (error) {
+         // A live owner can make this rejection waitable; retries still use the durable guard.
+diff --git a/src/agents/agent-command.peer-followup.test.ts b/src/agents/agent-command.peer-followup.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..aebc0fd8caeaba89d69e9cf83e01854a645e6ba3
+--- /dev/null
++++ b/src/agents/agent-command.peer-followup.test.ts
+@@ -0,0 +1,168 @@
++import { expect, it, vi } from "vitest";
++import { awaitGateBeforeSettlement, createDeferred } from "../../test/helpers/promise.js";
++import { REPLY_WORK_ADMISSION_OWNER } from "../auto-reply/reply/reply-turn-admission-owner.js";
++import * as abortSignal from "../infra/abort-signal.js";
++import { getAgentEventLifecycleGeneration } from "../infra/agent-events.js";
++import * as sessionAdmission from "../sessions/session-lifecycle-admission.js";
++import { beginSessionWorkAdmission } from "../sessions/session-lifecycle-admission.js";
++import {
++  agentCommandFromGatewayIngress,
++  compactionTestRuntime,
++  compactionTestState as state,
++  GATEWAY_INGRESS_ARGS,
++  makeCompactionResult,
++  registerAgentCommandCompactionTestHooks,
++  requireCompactionStorePath,
++} from "./agent-command.compaction.test-support.js";
++
++registerAgentCommandCompactionTestHooks();
++
++it.each([
++  { phase: "pre-fence", outcome: "completed" },
++  { phase: "pre-fence", outcome: "replaced" },
++  { phase: "fenced", outcome: "completed" },
++  { phase: "fenced", outcome: "replaced" },
++  { phase: "pre-fence", outcome: "cancelled" },
++  { phase: "fenced", outcome: "cancelled" },
++  { phase: "subagent-pre-fence", outcome: "completed" },
++  { phase: "internal", outcome: "independent" },
++  { phase: "admitted-recovery", outcome: "independent" },
++] as const)(
++  "preserves reply-owner ordering and exemptions: $phase/$outcome",
++  async ({ phase, outcome }) => {
++    const sessionKey =
++      phase === "subagent-pre-fence"
++        ? "agent:main:subagent:peer-receiver"
++        : "agent:main:discord:channel:peer-receiver";
++    const sessionId = "peer-receiver-session";
++    const lifecycleGeneration = getAgentEventLifecycleGeneration();
++    const target = { agentId: "main", sessionKey, storePath: requireCompactionStorePath() };
++    await compactionTestRuntime.replaceSessionEntry(target, {
++      sessionId,
++      updatedAt: Date.now(),
++      abortedLastRun: false,
++      ...(phase === "fenced"
++        ? {
++            restartRecoveryRuns: [{ runId: "channel-predecessor", lifecycleGeneration }],
++            mainRestartRecovery: { cycleId: "reply-cycle", revision: 1, chargedAttempts: 0 },
++          }
++        : {}),
++    });
++    const predecessor = await beginSessionWorkAdmission({
++      scope: target.storePath,
++      identities: [sessionKey],
++      owner: REPLY_WORK_ADMISSION_OWNER,
++      assertAllowed() {},
++    });
++    const waitEntered = createDeferred();
++    const replyReleases = new Set<Promise<unknown>>();
++    const getOwnerRelease = sessionAdmission.getSessionWorkAdmissionOwnerRelease;
++    using ownerObservation = vi
++      .spyOn(sessionAdmission, "getSessionWorkAdmissionOwnerRelease")
++      .mockImplementation((params) => {
++        const pending = getOwnerRelease(params);
++        if (pending && params.owner === REPLY_WORK_ADMISSION_OWNER) {
++          replyReleases.add(pending);
++        }
++        return pending;
++      });
++    const race = abortSignal.racePromiseWithAbortSignal;
++    const observeWait: typeof race = (operation, signal, createError) => {
++      if (typeof operation !== "function" && replyReleases.has(operation)) {
++        waitEntered.resolve();
++      }
++      return race(operation, signal, createError);
++    };
++    using waitObservation = vi
++      .spyOn(abortSignal, "racePromiseWithAbortSignal")
++      .mockImplementation(observeWait);
++    state.runAgentAttemptMock.mockResolvedValue(
++      makeCompactionResult({ sessionId, text: "peer result processed", runner: "embedded" }),
++    );
++    const controller = new AbortController();
++    const followup = agentCommandFromGatewayIngress(
++      {
++        sessionKey,
++        sessionId,
++        runId: "peer-followup",
++        abortSignal: controller.signal,
++        message: "The synthetic read-only check finished.",
++        allowModelOverride: false,
++        ...(phase === "internal" ? { sessionEffects: "internal" as const } : {}),
++        ...(phase === "admitted-recovery" ? { mainRestartRecoveryAdmitted: true } : {}),
++        inputProvenance: {
++          kind: "inter_session",
++          sourceSessionKey: "agent:main:discord:channel:peer-source",
++          sourceTool: "sessions_send",
++        },
++        sourceReplyDeliveryMode: "message_tool_only",
++      },
++      ...GATEWAY_INGRESS_ARGS,
++    );
++    void followup.catch(() => {});
++    try {
++      if (outcome === "independent") {
++        await awaitGateBeforeSettlement(
++          followup,
++          waitEntered.promise,
++          "independent ingress unexpectedly waited for the reply owner",
++        );
++        expect(state.runAgentAttemptMock).toHaveBeenCalledOnce();
++        expect(
++          getOwnerRelease({
++            scope: target.storePath,
++            identities: [sessionKey],
++            owner: REPLY_WORK_ADMISSION_OWNER,
++          }),
++        ).toBeDefined();
++        return;
++      }
++      await awaitGateBeforeSettlement(
++        waitEntered.promise,
++        followup,
++        "peer bypassed active reply owner",
++      );
++      expect(ownerObservation).toHaveBeenCalled();
++      expect(waitObservation).toHaveBeenCalled();
++      expect(state.runAgentAttemptMock).not.toHaveBeenCalled();
++      if (outcome === "cancelled") {
++        const before = compactionTestRuntime.loadSessionEntry(target);
++        controller.abort();
++        await expect(followup).rejects.toMatchObject({ name: "AbortError" });
++        expect(state.runAgentAttemptMock).not.toHaveBeenCalled();
++        expect(compactionTestRuntime.loadSessionEntry(target)).toEqual(before);
++        expect(
++          getOwnerRelease({
++            ...target,
++            identities: [sessionKey],
++            scope: target.storePath,
++            owner: REPLY_WORK_ADMISSION_OWNER,
++          }),
++        ).toBeDefined();
++        return;
++      }
++      await compactionTestRuntime.replaceSessionEntry(target, {
++        sessionId: outcome === "completed" ? sessionId : "replacement-session",
++        updatedAt: Date.now(),
++        status: "done",
++        abortedLastRun: false,
++        restartRecoveryTerminalRunIds: ["channel-predecessor"],
++      });
++      predecessor.release();
++      if (outcome === "replaced") {
++        await expect(followup).rejects.toMatchObject({ code: "SESSION_WORK_START_CHANGED" });
++        expect(state.runAgentAttemptMock).not.toHaveBeenCalled();
++        expect(compactionTestRuntime.loadSessionEntry(target)?.sessionId).toBe(
++          "replacement-session",
++        );
++      } else {
++        await followup;
++        expect(state.runAgentAttemptMock).toHaveBeenCalledOnce();
++        expect(compactionTestRuntime.loadSessionEntry(target)?.sessionId).toBe(sessionId);
++      }
++    } finally {
++      predecessor.release();
++      await followup.catch(() => {});
++    }
++  },
++);
+diff --git a/src/agents/bash-tools.exec-authorization.integration.test.ts b/src/agents/bash-tools.exec-authorization.integration.test.ts
+index 13f0d8dd52f28728f4906c5a519f218b983f18c7..dfce8bff192543a415c58f5ef305c2ade65a233a 100644
+--- a/src/agents/bash-tools.exec-authorization.integration.test.ts
++++ b/src/agents/bash-tools.exec-authorization.integration.test.ts
+@@ -3,13 +3,20 @@ import fs from "node:fs";
+ import path from "node:path";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
++import { captureExecutionIdentityAdmissionEnvelope } from "../audit/execution-identity.test-support.js";
+ import { saveExecApprovals } from "../infra/exec-approvals-store.test-support.js";
+ import { loadExecApprovalsReadOnly } from "../infra/exec-approvals.js";
+ import type { ExecAutoReviewer } from "../infra/exec-auto-review.js";
+ import { resolveExecutablePath } from "../infra/executable-path.js";
++import * as relayIntegration from "../process/spawn-broker/relay-integration.js";
+ import { createProcessSupervisor } from "../process/supervisor/supervisor.js";
+ import type { ProcessSupervisor } from "../process/supervisor/types.js";
+-import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
++import {
++  closeOpenClawStateDatabaseForTest,
++  openOpenClawStateDatabase,
++} from "../state/openclaw-state-db.js";
++import { captureOpenClawStateWorkerContext } from "../state/openclaw-state-worker-context.js";
++import { executeOpenClawStateWorker } from "../state/openclaw-state-worker-store.js";
+ import { resetProcessRegistryForTests } from "./bash-process-registry.test-support.js";
+ import { createExecTool } from "./bash-tools.exec-run.js";
+ import { callGatewayTool } from "./tools/gateway.js";
+@@ -298,6 +305,80 @@ describe.skipIf(process.platform === "win32")("gateway execution authorization b
+     },
+   );
+ 
++  it.each([false, true])(
++    "keeps first-use integrity refusal separate from native cleanup (primed=%s)",
++    async (primed) => {
++      vi.stubEnv("OPENCLAW_EXEC_SHELL_SNAPSHOT", "0");
++      const source = openOpenClawStateDatabase();
++      const identityPresent = () =>
++        source.db
++          .prepare("SELECT name FROM sqlite_schema WHERE name = 'execution_identity_contexts'")
++          .get() !== undefined;
++      expect(identityPresent()).toBe(false);
++      const persistIdentity = async (id: string) => {
++        const envelope = captureExecutionIdentityAdmissionEnvelope(
++          {
++            runId: id,
++            agentId: "main",
++            ingress: { kind: "local-cli", boundary: "agent-command.local", state: "present" },
++            runtime: { kind: "embedded" },
++          },
++          { contextId: id, executionId: id, runtimeInstanceId: "schema-admission-fixture" },
++        );
++        const result = await executeOpenClawStateWorker(captureOpenClawStateWorkerContext(), {
++          type: "audit.writer.process",
++          input: { type: "record-execution-identity", work: { kind: "capture", envelope } },
++        });
++        expect(result).toEqual({ status: "settled" });
++      };
++      if (primed) {
++        await persistIdentity("identity-before-policy");
++      }
++      const liveSupervisor = supervisor!;
++      const scopeKey = "first-use-integrity-cleanup";
++      const joinCleanup = liveSupervisor.acquireScopeCleanup(scopeKey, {
++        processTree: "required-all",
++      });
++      let launchBoundaryEntered = 0;
++      boundary.spawn.mockImplementation((input) => liveSupervisor.spawn({ ...input, scopeKey }));
++      const createSender = relayIntegration.createServiceChildControlSender;
++      using senderObservation = vi
++        .spyOn(relayIntegration, "createServiceChildControlSender")
++        .mockImplementation((params) => {
++          const send = createSender(params);
++          return async (payload, initiate) => {
++            if (payload.type === "launch") {
++              launchBoundaryEntered += 1;
++              await persistIdentity("identity-at-launch");
++            }
++            return await send(payload, initiate);
++          };
++        });
++      const marker = path.join(root, "launched.txt");
++      try {
++        const pending = tool(reviewer()).execute("first-use-integrity", {
++          command: "/usr/bin/touch launched.txt",
++        });
++        if (primed) {
++          const result = await pending;
++          expect(result.details.status).toBe("completed");
++          expect(fs.existsSync(marker)).toBe(true);
++        } else {
++          await expect(pending).rejects.toThrow(
++            "Direct shared-state reader requires current integrity admission",
++          );
++          expect(fs.existsSync(marker)).toBe(false);
++        }
++        expect(senderObservation).toHaveBeenCalled();
++        expect(launchBoundaryEntered).toBe(1);
++        expect(identityPresent()).toBe(true);
++        await expect(joinCleanup()).resolves.toBeUndefined();
++      } finally {
++        await joinCleanup().catch(() => undefined);
++      }
++    },
++  );
++
+   it("rechecks policy after deferred supervisor admission", async () => {
+     let started = 0;
+     const liveSupervisor = supervisor!;
+diff --git a/src/agents/subagents/announce/subagent-announce.requester-settle-admission.test.ts b/src/agents/subagents/announce/subagent-announce.requester-settle-admission.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..95e4908fce93c97fc297cdd3f27fb86a5210e7bc
+--- /dev/null
++++ b/src/agents/subagents/announce/subagent-announce.requester-settle-admission.test.ts
+@@ -0,0 +1,335 @@
++// Preserve the provider fixture before modules that consume model preparation.
++// oxfmt-ignore
++import { cleanupPreparedModelRuntimeHarness, getPreparedModelRuntimeMocks, resetPreparedModelRuntimeHarness } from "../../prepared-model-runtime.test-harness.js";
++import { afterEach, beforeEach, expect, it, vi } from "vitest";
++import {
++  clearConfigCache,
++  clearRuntimeConfigSnapshot,
++  type OpenClawConfig,
++} from "../../../config/config.js";
++import { createAgentRuntimeApprovalAuthorityValidator } from "../../../gateway/agent-runtime-approval-authority.js";
++import { createGatewayInstanceRuntime } from "../../../gateway/server-instance-runtime.js";
++import { createRequestGatewayMethodRegistry } from "../../../gateway/server-methods.js";
++import { createChatAbortContext } from "../../../gateway/server-methods/chat.abort.test-helpers.js";
++import type { GatewayRequestContext } from "../../../gateway/server-methods/types.js";
++import {
++  loadGatewayModelCatalogSnapshot,
++  readPreparedGatewayModelCatalog,
++} from "../../../gateway/server-model-catalog.js";
++import { createSyntheticPluginRuntimeClient } from "../../../gateway/server-plugin-runtime-client.js";
++import { getActivePluginRegistry } from "../../../plugins/runtime.js";
++import {
++  bindGatewayContextResolver,
++  withPluginRuntimeGatewayRequestScope,
++} from "../../../plugins/runtime/gateway-request-scope.js";
++import { AsyncWorkScope } from "../../../shared/async-work-scope.js";
++import { createTestRegistry } from "../../../test-utils/channel-plugins.js";
++import {
++  createOpenClawTestState,
++  type OpenClawTestState,
++} from "../../../test-utils/openclaw-test-state.js";
++import { resolvePreparedRunAdmission } from "../../admitted-run-context.js";
++import { refreshPreparedModelRuntimeSnapshots } from "../../prepared-model-runtime.js";
++import { ModelRegistry } from "../../sessions/model-registry.js";
++import { subagentRuns } from "../registry/subagent-registry-memory.js";
++import {
++  loadSubagentRegistryFromSqlite,
++  persistRegistryFixture,
++} from "../registry/subagent-registry-state.fixture.test-support.js";
++import {
++  settleSubagentRegistryPersistenceWork,
++  writeSubagentSessionEntry,
++} from "../registry/subagent-registry.persistence.test-support.js";
++import { resetSubagentRegistryForTests } from "../registry/subagent-registry.test-helpers.js";
++import * as settleIdentity from "../registry/subagent-requester-settle-identity.js";
++import { maybeWakeRequesterAfterAllChildrenSettled } from "./subagent-announce.requester-settle-wake.js";
++import {
++  makeSettledChild,
++  transitionBatch,
++  completeBatch,
++  completeBatchSpy,
++} from "./subagent-announce.requester-settle-wake.test-support.js";
++
++const runEmbeddedAgent = vi.hoisted(() =>
++  vi.fn<typeof import("../../embedded-agent.js").runEmbeddedAgent>(),
++);
++// mock-isolation: Only provider execution is substituted; Gateway, preparation and token admission are real.
++vi.mock("../../embedded-agent.js", async () => {
++  const lifecycle = await import("../../embedded-agent-runner/runs.js");
++  const { resolveEmbeddedSessionLane } = await import("../../embedded-agent-runner/lanes.js");
++  const { resolveActiveEmbeddedRunSessionId } =
++    await import("../../embedded-agent-runner/active-run-projections.js");
++  return {
++    ...lifecycle,
++    resolveActiveEmbeddedRunSessionId,
++    resolveEmbeddedSessionLane,
++    runEmbeddedAgent,
++  } satisfies typeof import("../../embedded-agent.runtime.js");
++});
++
++let state: OpenClawTestState;
++beforeEach(async () => {
++  state = await createOpenClawTestState({ label: "settle-admission" });
++  await resetPreparedModelRuntimeHarness(state);
++  await resetSubagentRegistryForTests({ persist: false });
++  runEmbeddedAgent.mockReset();
++  completeBatchSpy.mockClear();
++});
++afterEach(async ({ task }) => {
++  await settleSubagentRegistryPersistenceWork();
++  const { closeSkillsWatchers } = await import("../../../skills/runtime/refresh.js");
++  await closeSkillsWatchers(true);
++  await resetSubagentRegistryForTests({ persist: false });
++  clearRuntimeConfigSnapshot();
++  clearConfigCache();
++  await cleanupPreparedModelRuntimeHarness(state, task.result?.state === "fail");
++});
++
++it.each([
++  { count: 4, audit: true, legacyReplay: false },
++  { count: 5, audit: true, legacyReplay: false },
++  { count: 5, audit: false, legacyReplay: false },
++  { count: 5, audit: false, legacyReplay: true },
++])(
++  "admits one real requester wake for $count completed UUID children (audit=$audit, legacy=$legacyReplay)",
++  async ({ count, audit, legacyReplay }) => {
++    const requesterSessionKey = "agent:main:discord:channel:1000000000000000000";
++    const cfg = {
++      logging: { audit: { enabled: audit, executionIdentity: audit } },
++      agents: {
++        ownership: "explicit",
++        defaults: {
++          workspace: state.stateDir,
++          systemAgent: { agentId: "main" },
++          model: { primary: "custom/test-model" },
++        },
++        entries: { main: { workspace: state.stateDir } },
++      },
++      models: {
++        mode: "replace",
++        providers: {
++          custom: {
++            api: "openai-completions",
++            baseUrl: "https://example.invalid/v1",
++            models: [
++              {
++                id: "test-model",
++                name: "Test model",
++                input: ["text"],
++                maxTokens: 1024,
++                reasoning: false,
++                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
++              },
++            ],
++          },
++        },
++      },
++    } satisfies OpenClawConfig;
++    await state.writeConfig(cfg);
++    clearConfigCache();
++    clearRuntimeConfigSnapshot();
++    const prepared = getPreparedModelRuntimeMocks();
++    prepared.modelRegistry.fork.mockImplementation((authStorage) =>
++      ModelRegistry.inMemory(authStorage),
++    );
++    const model = {
++      api: "openai-completions" as const,
++      baseUrl: "https://example.invalid/v1",
++      contextWindow: 4096,
++      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
++      id: "test-model",
++      input: ["text" as const],
++      maxTokens: 1024,
++      name: "Test model",
++      provider: "custom",
++      reasoning: false,
++    };
++    prepared.configuredAgentIds = ["main"];
++    prepared.configuredAgentDirs.set("main", state.agentDir("main"));
++    prepared.configuredWorkspaces.set("main", state.stateDir);
++    prepared.buildPreparedModelCatalogSnapshot.mockResolvedValue({
++      entries: [model],
++      routeVariants: [model],
++    });
++    prepared.loadAgentRuntimePluginRegistryHandle.mockImplementation(
++      () => getActivePluginRegistry() ?? createTestRegistry([]),
++    );
++    const storePath = await writeSubagentSessionEntry({
++      stateDir: state.stateDir,
++      agentId: "main",
++      sessionKey: requesterSessionKey,
++      defaultSessionId: "requester-session",
++    });
++    await refreshPreparedModelRuntimeSnapshots(cfg, {
++      gatewayLifecycle: true,
++      catalogMode: "static",
++      defaultWorkspaceDir: state.stateDir,
++    });
++    const execution = new AsyncWorkScope();
++    const context = createChatAbortContext({
++      trackExecution: <T>(run: () => T | Promise<T>) => execution.track(run),
++      getRuntimeConfig: () => cfg,
++      getSessionEventSubscriberConnIds: () => new Set(),
++      broadcastToConnIds: vi.fn(),
++    }) as unknown as GatewayRequestContext;
++    context.resolveGatewayContext = () => context;
++    context.addChatRun = context.chatRunState.registry.add;
++    context.removeChatRun = context.chatRunState.registry.remove;
++    context.loadGatewayModelCatalogSnapshot = (request) =>
++      loadGatewayModelCatalogSnapshot({ ...request, getConfig: () => cfg });
++    context.loadGatewayModelCatalog = async (request) =>
++      (await context.loadGatewayModelCatalogSnapshot(request)).entries;
++    context.readPreparedGatewayModelCatalog = (request) =>
++      readPreparedGatewayModelCatalog({ ...request, getConfig: () => cfg });
++    context.validateAgentRuntimeApprovalAuthority = createAgentRuntimeApprovalAuthorityValidator();
++    const methods = createRequestGatewayMethodRegistry();
++    let runtime = createGatewayInstanceRuntime({
++      getContext: () => context,
++      getMethodRegistry: () => methods,
++      isDispatchAvailable: () => true,
++    });
++    context.createAgentTurnFacade = runtime.createAgentTurnFacade;
++    context.recoveryRuntime = runtime.recovery;
++    context.getGatewayMethodRegistry = () => methods;
++    const admittedRunIds: string[] = [];
++    const admissionFailures: string[] = [];
++    runEmbeddedAgent.mockImplementation(async (params) => {
++      const admitted = await resolvePreparedRunAdmission({
++        runId: params.runId,
++        runtimeKind: "embedded",
++        admittedRunContext: params.admittedRunContext,
++        preparedRunAdmission: params.preparedRunAdmission,
++      }).catch((error: unknown) => {
++        admissionFailures.push(error instanceof Error ? error.message : String(error));
++        throw error;
++      });
++      expect(Boolean(admitted.executionIdentityToken)).toBe(audit);
++      admittedRunIds.push(params.runId);
++      await params.onExecutionStarted?.();
++      return {
++        payloads: [{ text: "Consolidated synthetic result." }],
++        meta: { durationMs: 1, finalAssistantVisibleText: "Consolidated synthetic result." },
++      };
++    });
++    const batchRunIds = Array.from(
++      { length: count },
++      (_, i) => "00000000-0000-4000-8000-" + String(i + 1).padStart(12, "0"),
++    );
++    let children = batchRunIds.map((runId) =>
++      makeSettledChild({
++        runId,
++        requesterSessionKey,
++        requesterAgentId: "main",
++        requesterStorePath: storePath,
++        requesterOrigin: { channel: "webchat" },
++        completionRequesterSessionId: "requester-session",
++        outcome: { status: "ok" },
++        delivery: { status: "delivered", disposition: "delivered" },
++        completion: { required: true, resultText: "Synthetic child result", capturedAt: 3000 },
++        requesterSettleWake: {
++          status: "pending",
++          attemptCount: 0,
++          batchRunIds,
++          rearmGeneration: 1,
++          requesterYieldBatch: true,
++        },
++      }),
++    );
++    for (const entry of children) {
++      subagentRuns.set(entry.runId, entry);
++      bindGatewayContextResolver(entry, () => context);
++    }
++    persistRegistryFixture(subagentRuns);
++    let publishCompletion = !legacyReplay;
++    let emulateLegacy = legacyReplay;
++    const publishTransition: typeof transitionBatch = (batch, next, onPublished) => {
++      if (emulateLegacy) {
++        // The shipped writer did not persist a producer marker.
++        delete next.identityVersion;
++      }
++      transitionBatch(batch, next, onPublished);
++      persistRegistryFixture(subagentRuns);
++    };
++    const canonicalIdentity = settleIdentity.buildRequesterSettleWakeIdentity;
++    // Model only the shipped first-attempt producer, not admission or delivery decisions.
++    using legacyProducer = legacyReplay
++      ? vi
++          .spyOn(settleIdentity, "buildRequesterSettleWakeIdentity")
++          .mockImplementation((params) => {
++            const identity = canonicalIdentity(params);
++            return { ...identity, runId: "announce:" + identity.batchKey };
++          })
++      : undefined;
++    const commitCompletion: typeof completeBatch = (...args) => {
++      if (publishCompletion) {
++        completeBatch(...args);
++      }
++    };
++    try {
++      const wake = () =>
++        withPluginRuntimeGatewayRequestScope(
++          { context, client: createSyntheticPluginRuntimeClient(), isWebchatConnect: () => false },
++          () =>
++            maybeWakeRequesterAfterAllChildrenSettled({
++              requesterSessionKey,
++              settledEntry: children[0]!,
++              isSourceCurrent: () => true,
++              transitionBatch: publishTransition,
++              completeBatch: commitCompletion,
++            }),
++        );
++      const delivered = await wake();
++      expect(admissionFailures).toEqual([]);
++      expect(
++        delivered,
++        JSON.stringify({
++          completed: completeBatchSpy.mock.calls,
++          states: children.map((entry) => entry.requesterSettleWake),
++        }),
++      ).toBe(true);
++      expect({
++        delivered,
++        errors: children.map((entry) => entry.requesterSettleWake?.lastError),
++      }).toEqual({ delivered: true, errors: Array(count).fill(undefined) });
++      expect(admittedRunIds).toHaveLength(1);
++      if (legacyReplay) {
++        expect(admittedRunIds[0]!.length).toBeGreaterThan(256);
++        expect(completeBatchSpy).not.toHaveBeenCalled();
++        legacyProducer?.mockRestore();
++        emulateLegacy = false;
++        publishCompletion = true;
++        runtime.close();
++        context.dedupe.clear();
++        runtime = createGatewayInstanceRuntime({
++          getContext: () => context,
++          getMethodRegistry: () => methods,
++          isDispatchAvailable: () => true,
++        });
++        context.createAgentTurnFacade = runtime.createAgentTurnFacade;
++        context.recoveryRuntime = runtime.recovery;
++        const restored = loadSubagentRegistryFromSqlite();
++        children = batchRunIds.map((id) => {
++          const entry = restored.get(id);
++          if (!entry) {
++            throw new Error("Expected the durable legacy cohort");
++          }
++          expect(entry.requesterSettleWake?.identityVersion).toBeUndefined();
++          subagentRuns.set(id, entry);
++          bindGatewayContextResolver(entry, () => context);
++          return entry;
++        });
++        // Missing durable final-delivery evidence is still not permission to run again.
++        await expect(wake()).resolves.toBe(false);
++        expect(admittedRunIds).toHaveLength(1);
++      }
++      expect(completeBatchSpy).toHaveBeenCalledOnce();
++      expect(children.every((entry) => entry.requesterSettleWake === undefined)).toBe(true);
++      await expect(wake()).resolves.toBe(false);
++      expect(admittedRunIds).toHaveLength(1);
++    } finally {
++      execution.beginClose();
++      await execution.drain();
++      runtime.close();
++    }
++  },
++);
+diff --git a/src/agents/subagents/announce/subagent-announce.requester-settle-results.test.ts b/src/agents/subagents/announce/subagent-announce.requester-settle-results.test.ts
+index 581c3777703f54925a05180350bc0d6e6af1294e..dff99d435981b26066a92ab0379db36a66ad40e9 100644
+--- a/src/agents/subagents/announce/subagent-announce.requester-settle-results.test.ts
++++ b/src/agents/subagents/announce/subagent-announce.requester-settle-results.test.ts
+@@ -1,18 +1,125 @@
+ import { describe, expect, it } from "vitest";
++import { matchesTranscriptEvent } from "../../../sessions/transcript-visible-record.js";
++import { buildAgentRunTerminalReplySnapshot } from "../../agent-run-terminal-reply.js";
+ import {
+   registryRuntimeMock,
++  sessionStore,
++  findTranscriptEventMock,
+   wakeParams,
+ } from "./subagent-announce.requester-settle-fixture.test-support.js";
+ import {
+   deliverSpy,
+   makeSettledChild,
+   deliveredCallArg,
++  requesterSettleKey,
++  transitionBatchSpy,
++  completeBatchSpy,
+ } from "./subagent-announce.requester-settle-wake.test-support.js";
+ 
+ const { maybeWakeRequesterAfterAllChildrenSettled } =
+   await import("./subagent-announce.requester-settle-wake.js");
+ 
+ describe("maybeWakeRequesterAfterAllChildrenSettled results", () => {
++  it("includes the whole connected drained wave for a staggered fan-out", async () => {
++    // A overlaps B and B overlaps C, but A never overlaps C. When C settles
++    // last, A's results must still ride the wake and the idempotency key must
++    // cover the full component (any last-settler computes the same batch).
++    const resultPrefix = "<result>".repeat(700);
++    const childA = makeSettledChild({
++      runId: "run-a",
++      createdAt: 1_000,
++      startedAt: 1_000,
++      endedAt: 2_000,
++      outcome: { status: "ok" },
++    });
++    const childB = makeSettledChild({
++      runId: "run-b",
++      createdAt: 1_500,
++      startedAt: 2_100,
++      endedAt: 3_000,
++      outcome: { status: "ok" },
++    });
++    const childC = makeSettledChild({
++      runId: "run-c",
++      createdAt: 2_500,
++      startedAt: 2_500,
++      endedAt: 4_000,
++      outcome: { status: "ok" },
++    });
++    const children = [childA, childB, childC];
++    const transcripts = new Map<string, unknown[]>();
++    const findings = ["alpha findings", "bravo findings", "charlie findings"];
++    for (const [index, child] of children.entries()) {
++      const text = `${resultPrefix}${findings[index]}`;
++      const terminalReply = buildAgentRunTerminalReplySnapshot({ visibleText: text });
++      expect(terminalReply.disposition).toBe("visible");
++      if (terminalReply.disposition !== "visible") {
++        throw new Error("expected visible terminal evidence");
++      }
++      child.completion = { required: true, terminalReply, resultText: terminalReply.text };
++      expect(terminalReply.text).toHaveLength(4_096);
++      const sessionId = `session-${child.runId}`;
++      sessionStore[child.childSessionKey] = { sessionId };
++      const assistant = (runId: string, messageText: string, stopReason = "stop") => ({
++        type: "message",
++        message: {
++          role: "assistant",
++          stopReason,
++          content: [{ type: "text", text: messageText }],
++          __openclaw: { runId },
++        },
++      });
++      transcripts.set(sessionId, [
++        assistant("previous-run", "stale previous result"),
++        assistant(child.runId, "earlier commentary"),
++        assistant(child.runId, text),
++        assistant("replacement-run", "unrelated later result"),
++        assistant(child.runId, "unfinished follow-up", "toolUse"),
++      ]);
++    }
++    findTranscriptEventMock.mockImplementation(async ({ sessionId }, match) => {
++      const event = transcripts
++        .get(sessionId)
++        ?.findLast((candidate) => matchesTranscriptEvent(candidate, match));
++      return event === undefined ? undefined : { event };
++    });
++    registryRuntimeMock.listSubagentRunsForRequester.mockReturnValue(children);
++
++    const woke = await maybeWakeRequesterAfterAllChildrenSettled(
++      wakeParams({ settledEntry: childC }),
++    );
++
++    expect(woke).toBe(true);
++    expect(deliverSpy).toHaveBeenCalledOnce();
++    const call = deliveredCallArg();
++    expect(call.directIdempotencyKey).toBe(requesterSettleKey("run-a,run-b,run-c"));
++    expect(transitionBatchSpy).toHaveBeenNthCalledWith(1, ["run-a", "run-b", "run-c"], {
++      status: "dispatching",
++      identityVersion: 1,
++      attemptCount: 1,
++      deferralCount: 0,
++      batchRunIds: ["run-a", "run-b", "run-c"],
++    });
++    expect(transitionBatchSpy.mock.invocationCallOrder[0]).toBeLessThan(
++      deliverSpy.mock.invocationCallOrder[0] ?? Number.MAX_SAFE_INTEGER,
++    );
++    const message = String(call.triggerMessage);
++    for (const result of findings) {
++      expect(message).toContain(`${"&lt;result&gt;".repeat(700)}${result}`);
++    }
++    expect(message).not.toContain("stale previous result");
++    expect(message).not.toContain("earlier commentary");
++    expect(message).not.toContain("unrelated later result");
++    expect(message).not.toContain("unfinished follow-up");
++    expect(message.indexOf("alpha findings")).toBeLessThan(message.indexOf("bravo findings"));
++    expect(message.indexOf("bravo findings")).toBeLessThan(message.indexOf("charlie findings"));
++    expect(completeBatchSpy).toHaveBeenCalledExactlyOnceWith(
++      ["run-a", "run-b", "run-c"],
++      undefined,
++      { delivered: true, path: "direct" },
++    );
++  });
++
+   it("includes all six child outcomes when a successful completion has no output", async () => {
+     const children = (["ok", "timeout", "timeout", "ok", "timeout", "timeout"] as const).map(
+       (status, index) =>
+diff --git a/src/agents/subagents/announce/subagent-announce.requester-settle-state.ts b/src/agents/subagents/announce/subagent-announce.requester-settle-state.ts
+index fbc7e17b601b60ae6a3ddf567c4fe3784bbc8313..7448ba30f0d4dd7736c17f72602d60cf10e28371 100644
+--- a/src/agents/subagents/announce/subagent-announce.requester-settle-state.ts
++++ b/src/agents/subagents/announce/subagent-announce.requester-settle-state.ts
+@@ -2,6 +2,7 @@ import type {
+   RequesterSettleWakeState,
+   SubagentRunRecord,
+ } from "../registry/subagent-registry.types.js";
++import { isSupportedRequesterSettleIdentityVersion } from "../registry/subagent-requester-settle-identity.js";
+ import { isSameSubagentRun, isSameSubagentRunOwner } from "../registry/subagent-run-generation.js";
+ import type { SubagentAnnounceDeliveryResult } from "./subagent-announce-dispatch.js";
+ 
+@@ -63,6 +64,7 @@ export function createRequesterSettleBatchClaim(
+ 
+ export function retainedYieldIdentity(state: RequesterSettleWakeBatchState) {
+   return {
++    ...(state.identityVersion !== undefined ? { identityVersion: state.identityVersion } : {}),
+     ...(state.pauseNotice ? { pauseNotice: state.pauseNotice } : {}),
+     ...(state.requesterYieldBatch === true ? { requesterYieldBatch: true as const } : {}),
+     ...(state.afterRequesterYield === true ? { afterRequesterYield: true as const } : {}),
+@@ -82,6 +84,11 @@ export function startRequesterSettleWakeAttempt(
+     batchRunIds,
+     deferralCount: state.deferralCount,
+     ...retainedYieldIdentity(state),
++    // A pause owns one row, not its completion cohort. Only the full fresh cohort
++    // may mint a version; attempted legacy cohorts keep their shared retry identity.
++    ...(!state.pauseNotice && state.attemptCount === 0 && state.identityVersion === undefined
++      ? { identityVersion: 1 as const }
++      : {}),
+     ...admissionMarker,
+   };
+ }
+@@ -100,7 +107,17 @@ export function readSharedBatchState(
+     .filter((state): state is RequesterSettleWakeState => Boolean(state));
+   const dispatching = states.find((state) => state.status === "dispatching");
+   const source = dispatching ?? states[0];
++  if (
++    states.some(
++      (state) =>
++        !isSupportedRequesterSettleIdentityVersion(state.identityVersion) ||
++        state.identityVersion !== source?.identityVersion,
++    )
++  ) {
++    throw new Error("Unsupported or mixed requester settle identity versions");
++  }
+   return {
++    ...(source?.identityVersion !== undefined ? { identityVersion: source.identityVersion } : {}),
+     status: source?.status ?? "pending",
+     ...(source?.pauseNotice ? { pauseNotice: source.pauseNotice } : {}),
+     attemptCount: Math.max(0, ...states.map((state) => state.attemptCount)),
+diff --git a/src/agents/subagents/announce/subagent-announce.requester-settle-wake.test.ts b/src/agents/subagents/announce/subagent-announce.requester-settle-wake.test.ts
+index 5e22884bfb6782eabf4f23c8134ea0f8d75d348f..df4f89d744eb250124c8a0f31f26885e57a45e8f 100644
+--- a/src/agents/subagents/announce/subagent-announce.requester-settle-wake.test.ts
++++ b/src/agents/subagents/announce/subagent-announce.requester-settle-wake.test.ts
+@@ -255,105 +255,6 @@ describe("maybeWakeRequesterAfterAllChildrenSettled", () => {
+     },
+   );
+ 
+-  it("includes the whole connected drained wave for a staggered fan-out", async () => {
+-    // A overlaps B and B overlaps C, but A never overlaps C. When C settles
+-    // last, A's results must still ride the wake and the idempotency key must
+-    // cover the full component (any last-settler computes the same batch).
+-    const resultPrefix = "<result>".repeat(700);
+-    const childA = makeSettledChild({
+-      runId: "run-a",
+-      createdAt: 1_000,
+-      startedAt: 1_000,
+-      endedAt: 2_000,
+-      outcome: { status: "ok" },
+-    });
+-    const childB = makeSettledChild({
+-      runId: "run-b",
+-      createdAt: 1_500,
+-      startedAt: 2_100,
+-      endedAt: 3_000,
+-      outcome: { status: "ok" },
+-    });
+-    const childC = makeSettledChild({
+-      runId: "run-c",
+-      createdAt: 2_500,
+-      startedAt: 2_500,
+-      endedAt: 4_000,
+-      outcome: { status: "ok" },
+-    });
+-    const children = [childA, childB, childC];
+-    const transcripts = new Map<string, unknown[]>();
+-    const findings = ["alpha findings", "bravo findings", "charlie findings"];
+-    for (const [index, child] of children.entries()) {
+-      const text = `${resultPrefix}${findings[index]}`;
+-      const terminalReply = buildAgentRunTerminalReplySnapshot({ visibleText: text });
+-      expect(terminalReply.disposition).toBe("visible");
+-      if (terminalReply.disposition !== "visible") {
+-        throw new Error("expected visible terminal evidence");
+-      }
+-      child.completion = { required: true, terminalReply, resultText: terminalReply.text };
+-      expect(terminalReply.text).toHaveLength(4_096);
+-      const sessionId = `session-${child.runId}`;
+-      sessionStore[child.childSessionKey] = { sessionId };
+-      const assistant = (runId: string, messageText: string, stopReason = "stop") => ({
+-        type: "message",
+-        message: {
+-          role: "assistant",
+-          stopReason,
+-          content: [{ type: "text", text: messageText }],
+-          __openclaw: { runId },
+-        },
+-      });
+-      transcripts.set(sessionId, [
+-        assistant("previous-run", "stale previous result"),
+-        assistant(child.runId, "earlier commentary"),
+-        assistant(child.runId, text),
+-        assistant("replacement-run", "unrelated later result"),
+-        assistant(child.runId, "unfinished follow-up", "toolUse"),
+-      ]);
+-    }
+-    findTranscriptEventMock.mockImplementation(async ({ sessionId }, match) => {
+-      const event = transcripts
+-        .get(sessionId)
+-        ?.findLast((candidate) => matchesTranscriptEvent(candidate, match));
+-      return event === undefined ? undefined : { event };
+-    });
+-    registryRuntimeMock.listSubagentRunsForRequester.mockReturnValue(children);
+-
+-    const woke = await maybeWakeRequesterAfterAllChildrenSettled(
+-      wakeParams({ settledEntry: childC }),
+-    );
+-
+-    expect(woke).toBe(true);
+-    expect(deliverSpy).toHaveBeenCalledOnce();
+-    const call = deliveredCallArg();
+-    expect(call.directIdempotencyKey).toBe(requesterSettleKey("run-a,run-b,run-c"));
+-    expect(transitionBatchSpy).toHaveBeenNthCalledWith(1, ["run-a", "run-b", "run-c"], {
+-      status: "dispatching",
+-      attemptCount: 1,
+-      deferralCount: 0,
+-      batchRunIds: ["run-a", "run-b", "run-c"],
+-    });
+-    expect(transitionBatchSpy.mock.invocationCallOrder[0]).toBeLessThan(
+-      deliverSpy.mock.invocationCallOrder[0] ?? Number.MAX_SAFE_INTEGER,
+-    );
+-    const message = String(call.triggerMessage);
+-    for (const result of findings) {
+-      expect(message).toContain(`${"&lt;result&gt;".repeat(700)}${result}`);
+-    }
+-    expect(message).not.toContain("stale previous result");
+-    expect(message).not.toContain("earlier commentary");
+-    expect(message).not.toContain("unrelated later result");
+-    expect(message).not.toContain("unfinished follow-up");
+-    expect(message.indexOf("alpha findings")).toBeLessThan(message.indexOf("bravo findings"));
+-    expect(message.indexOf("bravo findings")).toBeLessThan(message.indexOf("charlie findings"));
+-    expect(completeBatchSpy).toHaveBeenCalledExactlyOnceWith(
+-      ["run-a", "run-b", "run-c"],
+-      undefined,
+-      { delivered: true, path: "direct" },
+-    );
+-  });
+-
+   it("ignores long-settled children from earlier non-overlapping spawns", async () => {
+     // A one-off completion after an old fan-out must not re-wake the requester
+     // about the historical batch: the old children ended before this one began.
+diff --git a/src/agents/subagents/announce/subagent-announce.requester-settle-wake.ts b/src/agents/subagents/announce/subagent-announce.requester-settle-wake.ts
+index a96dbe2edb0e9008c2fa10b25dc413bbc65285ec..eddedb966f430427a8b3dd02ed73f790fa453515 100644
+--- a/src/agents/subagents/announce/subagent-announce.requester-settle-wake.ts
++++ b/src/agents/subagents/announce/subagent-announce.requester-settle-wake.ts
+@@ -530,6 +530,7 @@ export async function maybeWakeRequesterAfterAllChildrenSettled(
+     const { runId: directIdempotencyKey } = buildRequesterSettleWakeIdentity({
+       requesterSessionKey,
+       requesterAgentId,
++      identityVersion: state.identityVersion,
+       batchRunIds,
+       rearmGeneration: selectedState.rearmGeneration,
+       attemptIndex,
+diff --git a/src/agents/subagents/registry/subagent-registry.types.ts b/src/agents/subagents/registry/subagent-registry.types.ts
+index 4b7a1cadb5489ff95521cb837cad19c0bafa89dc..78b66abedaec17b0e188c04f23be16eac5810c41 100644
+--- a/src/agents/subagents/registry/subagent-registry.types.ts
++++ b/src/agents/subagents/registry/subagent-registry.types.ts
+@@ -120,6 +120,8 @@ type SwarmQueuedLaunch = {
+ 
+ /** Durable outbox state for the top-level requester settle wake. */
+ export type RequesterSettleWakeState = {
++  /** Bounded producer admitted before dispatch; absent attempted cohorts retain legacy keys. */
++  identityVersion?: 1;
+   /** Pending message-wait notice; consuming it leaves the completion cohort armed. */
+   pauseNotice?: { acknowledgment: string };
+   status: "pending" | "dispatching";
+diff --git a/src/agents/subagents/registry/subagent-requester-settle-identity.test.ts b/src/agents/subagents/registry/subagent-requester-settle-identity.test.ts
+index a010f2790bcbcca0cd66ffd906743f0f5f00710f..cfde903f51efac52105c1209b36c2c649f5c22ca 100644
+--- a/src/agents/subagents/registry/subagent-requester-settle-identity.test.ts
++++ b/src/agents/subagents/registry/subagent-requester-settle-identity.test.ts
+@@ -1,12 +1,24 @@
++import { createHash } from "node:crypto";
+ import { describe, expect, it } from "vitest";
++import { createExecutionIdentityAdmissionToken } from "../../../audit/execution-identity-admission.js";
++import {
++  readSharedBatchState,
++  retainedYieldIdentity,
++  startRequesterSettleWakeAttempt,
++} from "../announce/subagent-announce.requester-settle-state.js";
+ import {
+   makeSettledChild,
+   REQUESTER,
+ } from "../announce/subagent-announce.requester-settle-wake.test-support.js";
++import { resetRequesterSettleWakeRetry } from "./subagent-delivery-state.js";
++import { bindSubagentRunRecord, rowToSubagentRunRecord } from "./subagent-registry.store.codec.js";
+ import {
+   buildRequesterSettleWakeIdentity,
++  captureRequesterSettleWakeProgress,
+   isRequesterSettleWakeForRun,
++  resolveCurrentRequesterSettleWakeBatch,
+ } from "./subagent-requester-settle-identity.js";
++import { copySubagentRunRuntimeOwner } from "./subagent-run-generation.js";
+ 
+ describe("requester settle wake identity", () => {
+   // The control scope must recognize exactly the key dispatch used, or a retried
+@@ -56,3 +68,169 @@ describe("requester settle wake identity", () => {
+     ).toBe(true);
+   });
+ });
++
++describe("bounded requester wake IDs", () => {
++  it.each([256, 257])("preserves the original %i-character identity or bounds it", (length) => {
++    const prefix = "announce:requester-settle:main:" + REQUESTER + ":";
++    const child = "x".repeat(length - prefix.length);
++    const original = prefix + child;
++    const identity = buildRequesterSettleWakeIdentity({
++      requesterSessionKey: REQUESTER,
++      requesterAgentId: "main",
++      batchRunIds: [child],
++      identityVersion: 1,
++    });
++    expect(identity.batchKey).toBe(original.slice("announce:".length));
++    expect(identity.runId).toBe(
++      length === 256
++        ? original
++        : "announce:requester-settle:sha256:" + createHash("sha256").update(original).digest("hex"),
++    );
++    expect(createExecutionIdentityAdmissionToken(identity.runId).runId).toBe(identity.runId);
++    if (length === 257) {
++      expect(() => createExecutionIdentityAdmissionToken(original)).toThrow("bounded contract");
++    }
++  });
++
++  it.each(
++    [
++      { sharedAttemptKey: false, pause: false },
++      { sharedAttemptKey: true, pause: false },
++      { sharedAttemptKey: true, pause: true },
++    ].flatMap((testCase) => [
++      { ...testCase, identityVersion: undefined },
++      { ...testCase, identityVersion: 1 as const },
++    ]),
++  )(
++    "keeps the persisted long cohort identity: %j",
++    ({ sharedAttemptKey, pause, identityVersion }) => {
++      const batchRunIds = pause ? ["a".repeat(220)] : ["a".repeat(120), "b".repeat(120)];
++      const options = {
++        requesterSessionKey: REQUESTER,
++        requesterAgentId: "main",
++        batchRunIds,
++        rearmGeneration: 1,
++        attemptIndex: 1,
++        sharedAttemptKey,
++        pause,
++        identityVersion,
++      };
++      const current = buildRequesterSettleWakeIdentity(options);
++      const legacy =
++        "announce:" + current.batchKey + (sharedAttemptKey && !pause ? "" : ":retry-1");
++      expect(legacy.length).toBeGreaterThan(256);
++      const entries = batchRunIds.map((runId) =>
++        makeSettledChild({
++          runId,
++          requesterAgentId: "main",
++          ...(sharedAttemptKey ? { completionTarget: "parent" as const } : {}),
++          ...(pause ? { pauseReason: "sessions_yield" as const } : {}),
++          requesterSettleWake: {
++            status: "dispatching",
++            attemptCount: 2,
++            identityVersion,
++            batchRunIds,
++            rearmGeneration: 1,
++            ...(pause ? { pauseNotice: { acknowledgment: "Waiting." } } : {}),
++          },
++        }),
++      );
++      const match = (runId: string) =>
++        isRequesterSettleWakeForRun({
++          entry: entries[0]!,
++          runId,
++          requesterSessionKey: REQUESTER,
++          requesterAgentId: "main",
++          runsById: new Map(entries.map((entry) => [entry.runId, entry])),
++        });
++      expect(match(current.runId)).toBe(true);
++      expect(match(legacy)).toBe(identityVersion === undefined);
++      expect(
++        buildRequesterSettleWakeIdentity({ ...options, batchRunIds: batchRunIds.toReversed() }),
++      ).toEqual(current);
++      expect(
++        match(buildRequesterSettleWakeIdentity({ ...options, rearmGeneration: 2 }).runId),
++      ).toBe(false);
++      expect(
++        match(
++          buildRequesterSettleWakeIdentity({ ...options, batchRunIds: ["c".repeat(220)] }).runId,
++        ),
++      ).toBe(false);
++      const previous = buildRequesterSettleWakeIdentity({ ...options, attemptIndex: 0 });
++      expect(match(previous.runId)).toBe(sharedAttemptKey && !pause);
++    },
++  );
++});
++
++describe("requester identity version custody", () => {
++  it("admits the marker only for fresh cohorts and retains it through deferral and pause reset", () => {
++    const fresh = startRequesterSettleWakeAttempt(
++      { status: "pending", attemptCount: 0 },
++      ["a"],
++      {},
++    );
++    expect(fresh.identityVersion).toBe(1);
++    const row = makeSettledChild({ runId: "a", requesterSettleWake: fresh });
++    expect(readSharedBatchState([row]).identityVersion).toBe(1);
++    expect(retainedYieldIdentity(fresh).identityVersion).toBe(1);
++    expect(resetRequesterSettleWakeRetry(fresh).identityVersion).toBe(1);
++    const paused = {
++      status: "pending" as const,
++      attemptCount: 0,
++      pauseNotice: { acknowledgment: "Waiting." },
++    };
++    expect(startRequesterSettleWakeAttempt(paused, ["a", "b"], {}).identityVersion).toBeUndefined();
++    expect(
++      startRequesterSettleWakeAttempt({ ...paused, identityVersion: 1 }, ["a", "b"], {})
++        .identityVersion,
++    ).toBe(1);
++    const legacy = startRequesterSettleWakeAttempt(
++      { status: "pending", attemptCount: 1 },
++      ["a"],
++      {},
++    );
++    expect(legacy.identityVersion).toBeUndefined();
++  });
++
++  it("preserves an unknown serialized version and refuses it instead of reminting legacy input", () => {
++    const row = makeSettledChild({ runId: "a", completion: { required: true } });
++    Object.defineProperty(row.requesterSettleWake!, "identityVersion", {
++      value: 9,
++      enumerable: true,
++    });
++    const restored = rowToSubagentRunRecord(bindSubagentRunRecord(row));
++    if (!restored) {
++      throw new Error("Expected an inspectable canonical row");
++    }
++    expect(Reflect.get(restored.requesterSettleWake!, "identityVersion")).toBe(9);
++    expect(() => readSharedBatchState([restored])).toThrow("Unsupported or mixed");
++  });
++
++  it("rejects mixed versions and revokes preparation when the version changes", () => {
++    const row = makeSettledChild({
++      runId: "a",
++      requesterSettleWake: {
++        status: "dispatching",
++        attemptCount: 1,
++        batchRunIds: ["a"],
++        rearmGeneration: 1,
++      },
++    });
++    const clone = copySubagentRunRuntimeOwner(row, structuredClone(row));
++    const compare = () =>
++      resolveCurrentRequesterSettleWakeBatch({
++        observed: [row],
++        currentRuns: [clone],
++        rearmGeneration: 1,
++        pause: false,
++        requireUnchangedProgress: true,
++      });
++    expect(compare()).toBeDefined();
++    clone.requesterSettleWake!.identityVersion = 1;
++    expect(captureRequesterSettleWakeProgress(clone)).not.toEqual(
++      captureRequesterSettleWakeProgress(row),
++    );
++    expect(compare()).toBeUndefined();
++    expect(() => readSharedBatchState([row, clone])).toThrow("Unsupported or mixed");
++  });
++});
+diff --git a/src/agents/subagents/registry/subagent-requester-settle-identity.ts b/src/agents/subagents/registry/subagent-requester-settle-identity.ts
+index af043091ff50acde8b58471a11a000d4f4859340..964dbf21ef0347e60addc7ef57e06ad9fa80d8f4 100644
+--- a/src/agents/subagents/registry/subagent-requester-settle-identity.ts
++++ b/src/agents/subagents/registry/subagent-requester-settle-identity.ts
+@@ -1,4 +1,6 @@
++import { createHash } from "node:crypto";
+ import { isDeepStrictEqual } from "node:util";
++import { CHAT_INPUT_RUN_ID_MAX_CHARS } from "../../../../packages/gateway-protocol/src/schema/chat-history-constants.js";
+ import { buildAnnounceIdempotencyKey } from "../../announce-idempotency.js";
+ import type { SubagentRunRecord } from "./subagent-registry.types.js";
+ import {
+@@ -7,9 +9,25 @@ import {
+   isSameSubagentRunOwner,
+ } from "./subagent-run-generation.js";
+ 
++export function isSupportedRequesterSettleIdentityVersion(
++  version: unknown,
++): version is 1 | undefined {
++  return version === undefined || version === 1;
++}
++
++function boundRequesterSettleRunId(runId: string): string {
++  // Preserve shipped short keys; hash the full retry/cohort identity, never truncate it.
++  return runId.length <= CHAT_INPUT_RUN_ID_MAX_CHARS
++    ? runId
++    : buildAnnounceIdempotencyKey(
++        `requester-settle:sha256:${createHash("sha256").update(runId).digest("hex")}`,
++      );
++}
++
+ export function buildRequesterSettleWakeIdentity(params: {
+   requesterSessionKey: string;
+   requesterAgentId?: string;
++  identityVersion?: 1;
+   batchRunIds: readonly string[];
+   rearmGeneration?: number;
+   attemptIndex?: number;
+@@ -22,6 +40,9 @@ export function buildRequesterSettleWakeIdentity(params: {
+   sharedAttemptKey?: boolean;
+   pause?: boolean;
+ }): { batchKey: string; runId: string } {
++  if (!isSupportedRequesterSettleIdentityVersion(params.identityVersion)) {
++    throw new Error("Unsupported requester settle identity version");
++  }
+   const batchKey = [
+     `requester-settle:${params.requesterAgentId ?? "unknown"}:${params.requesterSessionKey}:${params.batchRunIds.toSorted().join(",")}`,
+     params.rearmGeneration === undefined ? undefined : `yield-${params.rearmGeneration}`,
+@@ -30,13 +51,14 @@ export function buildRequesterSettleWakeIdentity(params: {
+     .filter(Boolean)
+     .join(":");
+   const attemptIndex = params.attemptIndex ?? 0;
++  const runId = buildAnnounceIdempotencyKey(
++    (params.sharedAttemptKey && !params.pause) || attemptIndex === 0
++      ? batchKey
++      : `${batchKey}:retry-${attemptIndex}`,
++  );
+   return {
+     batchKey,
+-    runId: buildAnnounceIdempotencyKey(
+-      (params.sharedAttemptKey && !params.pause) || attemptIndex === 0
+-        ? batchKey
+-        : `${batchKey}:retry-${attemptIndex}`,
+-    ),
++    runId: params.identityVersion === 1 ? boundRequesterSettleRunId(runId) : runId,
+   };
+ }
+ 
+@@ -75,12 +97,22 @@ export function isRequesterSettleWakeForRun(params: {
+         member.completionTarget === "parent"
+       );
+     });
++  if (
++    !isSupportedRequesterSettleIdentityVersion(wake.identityVersion) ||
++    batchRunIds.some(
++      (id) =>
++        params.runsById.get(id)?.requesterSettleWake?.identityVersion !== wake.identityVersion,
++    )
++  ) {
++    return false;
++  }
+   // Pending backoff still belongs to the last admitted attempt, not its next retry.
+   return (
+     params.runId ===
+     buildRequesterSettleWakeIdentity({
+       requesterSessionKey,
+       requesterAgentId,
++      identityVersion: wake.identityVersion,
+       batchRunIds,
+       rearmGeneration: wake.rearmGeneration,
+       attemptIndex: wake.attemptCount - 1,
+@@ -127,6 +159,7 @@ export function captureRequesterSettleWakeProgress(entry: SubagentRunRecord) {
+   return (
+     wake && {
+       status: wake.status,
++      identityVersion: wake.identityVersion,
+       attemptCount: wake.attemptCount,
+       replayCount: wake.replayCount ?? 0,
+       deferralCount: wake.deferralCount ?? 0,
+diff --git a/src/agents/worktrees/service.apfs.test.ts b/src/agents/worktrees/service.apfs.test.ts
+index 33b73ab80531812adf6dc3966c619776cfabf79d..5e79aa4d927df7cdca15e5ef93aa8ce6d7e7cae0 100644
+--- a/src/agents/worktrees/service.apfs.test.ts
++++ b/src/agents/worktrees/service.apfs.test.ts
+@@ -172,6 +172,24 @@ describe.skipIf(process.platform !== "darwin")("managed worktrees on native APFS
+     expect(await listTemplatesAsync(env)).toEqual([]);
+   });
+ 
++  it("preserves explicit source executable permissions at the native copy boundary", async () => {
++    const root = tempDirs.make("openclaw-service-apfs-mode-");
++    const source = path.join(root, "source");
++    const destination = path.join(root, "destination");
++    await fs.mkdir(source);
++    const executable = path.join(source, "executable");
++    await fs.writeFile(executable, Buffer.alloc(128 * 1024, 0x5a));
++    await fs.chmod(executable, 0o755);
++    expect((await fs.stat(executable)).mode & 0o777).toBe(0o755);
++    await nativeWorktreeFilesystem.copy(source, destination, { commitGuard: () => {} });
++    expect((await fs.stat(executable)).mode & 0o777).toBe(0o755);
++    expect((await fs.stat(path.join(destination, "executable"))).mode & 0o777).toBe(0o755);
++    expect(await fs.readFile(path.join(destination, "executable"))).toEqual(
++      await fs.readFile(executable),
++    );
++    expect(getApfsCloneId(path.join(destination, "executable"))).toBe(getApfsCloneId(executable));
++  });
++
+   it("clones through creation, independent provisioning, restore, invalidation and cleanup", async () => {
+     vi.stubEnv("GIT_CONFIG_NOSYSTEM", "1");
+     const root = tempDirs.make("openclaw-service-apfs-");
+@@ -180,6 +198,9 @@ describe.skipIf(process.platform !== "darwin")("managed worktrees on native APFS
+     await fs.writeFile(path.join(repo, ".worktreeinclude"), ".env.local\n");
+     await fs.writeFile(path.join(repo, "payload"), Buffer.alloc(128 * 1024, 0x5a));
+     await fs.writeFile(path.join(repo, "executable"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
++    await fs.chmod(path.join(repo, "executable"), 0o755);
++    const sourceMode = (await fs.stat(path.join(repo, "executable"))).mode & 0o777;
++    expect(sourceMode).toBe(0o755);
+     await fs.symlink("payload", path.join(repo, "link"));
+     await git(repo, "add", ".");
+     await git(repo, "commit", "-m", "source fixture");
+@@ -193,11 +214,24 @@ describe.skipIf(process.platform !== "darwin")("managed worktrees on native APFS
+     await fs.writeFile(path.join(repo, ".env.local"), "first");
+     const env = { ...process.env, OPENCLAW_STATE_DIR: path.join(root, "state") };
+     let now = Date.now();
++    const nativeControlService = new ManagedWorktreeService({
++      env,
++      getConfig: () => ({ worktreeAcceleration: false }),
++    });
++    const nativeControl = await nativeControlService.create({
++      repoRoot: repo,
++      name: "native-control",
++      baseRef: "HEAD",
++    });
++    const nativeMode = (await fs.stat(path.join(nativeControl.path, "executable"))).mode & 0o777;
++    expect(nativeMode & 0o100).toBe(sourceMode & 0o100);
+     const service = new ManagedWorktreeService({ env, now: () => now, getConfig: () => ({}) });
+     const first = await service.create({ repoRoot: repo, name: "first", baseRef: "HEAD" });
+     const template = (await listTemplatesAsync(env))[0];
+     assert(template);
+     expect(template.backend).toBe("apfs");
++    const templateMode = (await fs.stat(path.join(template.path, "executable"))).mode & 0o777;
++    expect(templateMode).toBe(nativeMode);
+     await fs.writeFile(path.join(repo, ".env.local"), "second");
+     const second = await service.create({ repoRoot: repo, name: "second", baseRef: "HEAD" });
+     expect((await listTemplatesAsync(env)).map((entry) => entry.id)).toEqual([template.id]);
+@@ -207,7 +241,15 @@ describe.skipIf(process.platform !== "darwin")("managed worktrees on native APFS
+       );
+       expect(await git(record.path, "status", "--porcelain")).toBe("");
+       expect(await git(record.path, "symbolic-ref", "--short", "HEAD")).toBe(record.branch);
+-      expect((await fs.stat(path.join(record.path, "executable"))).mode & 0o777).toBe(0o755);
++      const destinationMode = (await fs.stat(path.join(record.path, "executable"))).mode & 0o777;
++      console.info("APFS executable modes", {
++        sourceMode,
++        nativeMode,
++        templateMode,
++        destinationMode,
++      });
++      expect(destinationMode).toBe(nativeMode);
++      expect((await fs.stat(path.join(repo, "executable"))).mode & 0o777).toBe(sourceMode);
+       expect(await fs.readlink(path.join(record.path, "link"))).toBe("payload");
+       expect(await fs.readFile(path.join(record.path, "setup.txt"), "utf8")).toBe(record.path);
+     }
+diff --git a/src/auto-reply/reply/reply-turn-admission.recovery.test.ts b/src/auto-reply/reply/reply-turn-admission.recovery.test.ts
+index 89179e19d91651391d94725d0cf9ca9d7c56ca31..ffed90838ccf7396a30e51c23f08c9296b0a475b 100644
+--- a/src/auto-reply/reply/reply-turn-admission.recovery.test.ts
++++ b/src/auto-reply/reply/reply-turn-admission.recovery.test.ts
+@@ -17,6 +17,7 @@ import type { InternalSessionEntry as SessionEntry } from "../../config/sessions
+ import type { GatewayRecoveryRuntime } from "../../gateway/server-instance-runtime.types.js";
+ import type { GatewayRequestContext } from "../../gateway/server-methods/types.js";
+ import { getAgentEventLifecycleGeneration } from "../../infra/agent-events.js";
++import * as sessionAdmission from "../../sessions/session-lifecycle-admission.js";
+ import {
+   beginSessionWorkAdmission,
+   consumeSessionWorkAdmissionHandoff,
+@@ -28,6 +29,7 @@ import {
+ } from "../../sessions/session-lifecycle-admission.js";
+ import { createReplyOperation, replyRunRegistry } from "./reply-run-registry.js";
+ import { testing } from "./reply-run-registry.test-support.js";
++import { REPLY_WORK_ADMISSION_OWNER } from "./reply-turn-admission-owner.js";
+ import { admitTestReplyTurn, createSessionStore } from "./reply-turn-admission.test-support.js";
+ 
+ type Admission = Awaited<ReturnType<typeof admitTestReplyTurn>>;
+@@ -490,18 +492,19 @@ async function busyReply() {
+   };
+ }
+ 
+-function pauseRejectedClaim(runId: string, release?: Promise<void>) {
+-  const rejected = createDeferred();
+-  const claim = recoveryStore.claimMainSessionRecoveryOwner;
+-  vi.spyOn(recoveryStore, "claimMainSessionRecoveryOwner").mockImplementation(async (params) => {
+-    const result = await claim(params);
+-    if (params.runId === runId && result.kind === "invalidated") {
+-      rejected.resolve();
+-      await release;
++function observeBusyReplyWait(storePath: string) {
++  const waiting = createDeferred();
++  const ownerRelease = sessionAdmission.getSessionWorkAdmissionOwnerRelease;
++  // Observe the real predecessor lease; a reply must not need a rejected durable
++  // claim before the fixture allows that reply to finish.
++  vi.spyOn(sessionAdmission, "getSessionWorkAdmissionOwnerRelease").mockImplementation((params) => {
++    const release = ownerRelease(params);
++    if (release && params.scope === storePath && params.owner === REPLY_WORK_ADMISSION_OWNER) {
++      waiting.resolve();
+     }
+-    return result;
++    return release;
+   });
+-  return rejected.promise;
++  return waiting.promise;
+ }
+ 
+ it("keeps two accepted commands in FIFO order behind a real reply admission", async ({
+@@ -511,7 +514,8 @@ it("keeps two accepted commands in FIFO order behind a real reply admission", as
+   const refresh = createDeferred();
+   const refreshing = createDeferred();
+   const secondPrepared = createDeferred();
+-  const rejected = pauseRejectedClaim("first");
++  const waiting = observeBusyReplyWait(fixture.target.storePath);
++  const claim = vi.spyOn(recoveryStore, "claimMainSessionRecoveryOwner");
+   const order: string[] = [];
+   let preparations = 0;
+   try {
+@@ -534,7 +538,7 @@ it("keeps two accepted commands in FIFO order behind a real reply admission", as
+       }),
+     );
+     await withinTest(
+-      awaitGateBeforeSettlement(rejected, first, "Command skipped the busy claim"),
++      awaitGateBeforeSettlement(waiting, first, "Command skipped the active reply owner"),
+       signal,
+     );
+     const second = secondGateway.run(() =>
+@@ -550,6 +554,7 @@ it("keeps two accepted commands in FIFO order behind a real reply admission", as
+       }),
+     );
+     await withinTest(secondPrepared.promise, signal);
++    expect(claim).not.toHaveBeenCalled();
+     expect(order).toEqual([]);
+     await fixture.finish();
+     await withinTest(
+@@ -577,14 +582,16 @@ it.for(["cancelled", "retained fence"] as const)(
+   "does not execute the waiting command after %s",
+   async (outcome, { signal }) => {
+     const fixture = await busyReply();
+-    const rejected = pauseRejectedClaim("waiting");
++    const waiting = observeBusyReplyWait(fixture.target.storePath);
++    const claim = vi.spyOn(recoveryStore, "claimMainSessionRecoveryOwner");
+     const run = vi.fn(async () => "ran");
+     try {
+       const command = fixture.command("waiting", { run });
+       await withinTest(
+-        awaitGateBeforeSettlement(rejected, command, "Command skipped the busy claim"),
++        awaitGateBeforeSettlement(waiting, command, "Command skipped the active reply owner"),
+         signal,
+       );
++      expect(claim).not.toHaveBeenCalled();
+       if (outcome === "cancelled") {
+         fixture.controller.abort();
+       } else {
+@@ -601,23 +608,24 @@ it.for(["cancelled", "retained fence"] as const)(
+   },
+ );
+ 
+-it("keeps the reply release captured before its durable claim returns", async ({ signal }) => {
++it("waits for the captured reply release before making a durable claim", async ({ signal }) => {
+   const fixture = await busyReply();
+-  const returnClaim = createDeferred();
+-  const rejected = pauseRejectedClaim("racing", returnClaim.promise);
++  const waiting = observeBusyReplyWait(fixture.target.storePath);
++  const claim = vi.spyOn(recoveryStore, "claimMainSessionRecoveryOwner");
+   const run = vi.fn(async () => "ran");
+   try {
+     const command = fixture.command("racing", { run });
+     await withinTest(
+-      awaitGateBeforeSettlement(rejected, command, "Command skipped the busy claim"),
++      awaitGateBeforeSettlement(waiting, command, "Command skipped the active reply owner"),
+       signal,
+     );
++    expect(claim).not.toHaveBeenCalled();
++    expect(run).not.toHaveBeenCalled();
+     await fixture.finish();
+-    returnClaim.resolve();
+     await expect(withinTest(command, signal)).resolves.toBe("ran");
++    expect(claim).toHaveBeenCalledOnce();
+     expect(run).toHaveBeenCalledOnce();
+   } finally {
+-    returnClaim.resolve();
+     await fixture.cleanup();
+   }
+ });
+diff --git a/src/infra/exec-approvals-schema-admission.test.ts b/src/infra/exec-approvals-schema-admission.test.ts
+index 5eb24bca0c27d37e33db29010dccdba913971c5a..7539bb9b88561db0894b1253c640acef7f62c722 100644
+--- a/src/infra/exec-approvals-schema-admission.test.ts
++++ b/src/infra/exec-approvals-schema-admission.test.ts
+@@ -5,16 +5,21 @@ import type { AuditWriterRequest } from "../audit/audit-event-writer.types.js";
+ import { prepareExecutionIdentityContextAtAdmission } from "../audit/execution-identity.test-support.js";
+ import { insertOperatorApproval } from "../gateway/operator-approval-store.js";
+ import { listAgentProvenance } from "../state/agent-provenance.js";
++import { prepareOpenClawStateDirectReader } from "../state/openclaw-state-db-read-connection.js";
+ import {
+   closeOpenClawStateDatabaseAsync,
+   closeOpenClawStateDatabaseForTest,
+   openOpenClawStateDatabase,
+ } from "../state/openclaw-state-db.js";
++import type { OpenClawStateReadOnlyDatabase } from "../state/openclaw-state-read.types.js";
+ import { captureOpenClawStateWorkerContext } from "../state/openclaw-state-worker-context.js";
+ import { executeOpenClawStateWorker } from "../state/openclaw-state-worker-store.js";
+ import { listProfiles } from "../state/user-profile-reads.js";
+ import { commitExecAuthorizationLocked } from "./exec-approvals-authorization.js";
+-import { writeExecApprovalsConfigRow } from "./exec-approvals-sqlite.js";
++import {
++  snapshotFromExecApprovalsDatabase,
++  writeExecApprovalsConfigRow,
++} from "./exec-approvals-sqlite.js";
+ 
+ const tempDirs = useAutoCleanupTempDirTracker((cleanup) =>
+   afterEach(async () => {
+@@ -177,3 +182,61 @@ it("revokes prepared exec authority when a worker actually creates missing schem
+   expect(source.db.prepare("PRAGMA schema_version").get()).not.toEqual(before);
+   expect(assertCurrent).toThrow("Direct shared-state reader requires current integrity admission");
+ });
++
++it.each(["revision mismatch", "missing integrity context", "proof unavailable"] as const)(
++  "diagnoses direct-reader integrity refusal: %s without extra atomic loads",
++  (reason) => {
++    const { env, databasePath } = fixture();
++    const context = captureOpenClawStateWorkerContext({ env });
++    const integrity = context.stateIntegrity;
++    if (!integrity) {
++      throw new Error("Fixture did not capture integrity admission");
++    }
++    const reader = prepareOpenClawStateDirectReader(context);
++    const operation = vi.fn(
++      ({ db }: OpenClawStateReadOnlyDatabase) =>
++        snapshotFromExecApprovalsDatabase(db).file.defaults?.security,
++    );
++    expect(reader.read(operation)).toBe("allowlist");
++    expect(operation).toHaveBeenCalledOnce();
++    operation.mockClear();
++    context.existingSchemaPath = databasePath;
++    Atomics.store(new BigInt64Array(integrity.proof), 0, -1n);
++    const observedRevision = integrity.epoch + 1n;
++    if (reason === "revision mismatch") {
++      Atomics.store(new BigInt64Array(integrity.revision), 0, observedRevision);
++    } else if (reason === "missing integrity context") {
++      context.stateIntegrity = undefined;
++    }
++    const loads = vi.spyOn(Atomics, "load");
++    try {
++      const detail =
++        reason === "revision mismatch"
++          ? `revision mismatch (capturedEpoch=${integrity.epoch}, observedRevision=${observedRevision})`
++          : reason;
++      expect(() => reader.read(operation)).toThrowError(
++        new Error(`Direct shared-state reader requires current integrity admission: ${detail}`),
++      );
++      expect(operation).not.toHaveBeenCalled();
++      expect(
++        loads.mock.calls
++          .filter(([view]) => view.buffer === integrity.revision || view.buffer === integrity.proof)
++          .map(([view, index]) => [
++            view.buffer === integrity.revision ? "revision" : "proof",
++            index,
++          ]),
++      ).toEqual(
++        reason === "missing integrity context"
++          ? []
++          : reason === "revision mismatch"
++            ? [["revision", 0]]
++            : [
++                ["revision", 0],
++                ["proof", 0],
++              ],
++      );
++    } finally {
++      loads.mockRestore();
++    }
++  },
++);
+diff --git a/src/infra/git-exec.settled.test.ts b/src/infra/git-exec.settled.test.ts
+index 07165156d069903cdeba6184cc609a1194bd81ee..6744c10930536dbc1be7f099c0155920c1f21069 100644
+--- a/src/infra/git-exec.settled.test.ts
++++ b/src/infra/git-exec.settled.test.ts
+@@ -1,6 +1,10 @@
+-import fs from "node:fs/promises";
+ import path from "node:path";
+ import { afterEach, expect, it, vi } from "vitest";
++import {
++  fixtureReceiptClientSource,
++  openFixtureReceiptChannel,
++} from "../../test/helpers/fixture-receipts.js";
++import { withinTest } from "../../test/helpers/promise.js";
+ import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+ import { withWorktreeGitConfig } from "../agents/worktrees/checkout-git-config.js";
+ import { WORKTREE_CHECKOUT_TIMEOUT_MS } from "../agents/worktrees/git.js";
+@@ -8,15 +12,25 @@ import { removeManagedCheckout } from "../agents/worktrees/removal-git.js";
+ import * as commandExec from "../process/exec.js";
+ import { createDeferredCore } from "../shared/deferred.js";
+ 
+-const dirs = useAutoCleanupTempDirTracker(afterEach);
++let cleanupRemoval: (() => Promise<void>) | undefined;
++const dirs = useAutoCleanupTempDirTracker((cleanup) =>
++  afterEach(async () => {
++    // Vitest can start hooks while a timed-out body is still unwinding.
++    await cleanupRemoval?.();
++    cleanupRemoval = undefined;
++    cleanup();
++  }),
++);
+ afterEach(() => {
+   vi.useRealTimers();
+   vi.restoreAllMocks();
+ });
+ 
+-it("joins admitted recovery despite caller cancellation and the checkout removal deadline", async () => {
++it("joins admitted recovery despite caller cancellation and the checkout removal deadline", async ({
++  signal,
++}) => {
+   const directory = dirs.make("openclaw-settled-git-");
+-  const release = path.join(directory, "release");
++  const receipts = await openFixtureReceiptChannel();
+   const ready = createDeferredCore();
+   const controller = new AbortController();
+   const run = commandExec.runCommandWithTimeout;
+@@ -24,14 +38,14 @@ it("joins admitted recovery despite caller cancellation and the checkout removal
+     run(
+       [
+         process.execPath,
++        "--input-type=module",
+         "-e",
+         `
+-        const fs = require('node:fs');
+-        const dir = process.argv[1];
+-        const watcher = fs.watch(dir, () => {
+-          if (fs.existsSync(dir + '/release')) watcher.close();
+-        });
++        ${fixtureReceiptClientSource(receipts.endpoint)}
++        const source = process.argv[1];
++        const released = awaitRelease(source, 'settle');
+         process.stdout.write('ready\\n');
++        await released;
+       `,
+         directory,
+       ],
+@@ -65,20 +79,52 @@ it("joins admitted recovery despite caller cancellation and the checkout removal
+       controller.signal,
+     ),
+   );
++  let settled = false;
++  void removal
++    .finally(() => {
++      settled = true;
++    })
++    .catch(() => {});
++  let cleanupPromise: Promise<void> | undefined;
++  const cleanup = () =>
++    (cleanupPromise ??= (async () => {
++      vi.useRealTimers();
++      try {
++        receipts.release(directory, "settle");
++        await removal;
++      } finally {
++        await receipts.close();
++      }
++    })());
++  cleanupRemoval = cleanup;
++  const stages: string[] = ["started"];
+   try {
+-    await Promise.race([
+-      ready.promise,
+-      removal.then(() => {
+-        throw new Error("child exited before admission");
+-      }),
+-    ]);
++    await withinTest(
++      Promise.race([
++        ready.promise,
++        removal.then(() => {
++          throw new Error("child exited before admission");
++        }),
++      ]),
++      signal,
++    );
++    stages.push("ready");
++    console.info("git-settled stage: ready");
+     controller.abort();
+-    await vi.advanceTimersByTimeAsync(WORKTREE_CHECKOUT_TIMEOUT_MS + 1_000);
+-    await fs.writeFile(release, "settle");
+-    await expect(removal).resolves.toBeUndefined();
+-  } finally {
++    await withinTest(vi.advanceTimersByTimeAsync(WORKTREE_CHECKOUT_TIMEOUT_MS + 1_000), signal);
++    stages.push("clock-advanced");
++    console.info("git-settled stage: clock-advanced");
++    expect(settled).toBe(false);
++    // The deadline proof is complete. Native process/stream settlement must not
++    // inherit a stopped fake clock after the fixture receives its release.
+     vi.useRealTimers();
+-    await fs.writeFile(release, "settle");
+-    await removal;
++    receipts.release(directory, "settle");
++    stages.push("release-sent");
++    console.info("git-settled stage: release-sent");
++    await expect(withinTest(removal, signal)).resolves.toBeUndefined();
++    stages.push("removal-settled");
++  } finally {
++    console.info("git-settled stages:", stages.join(" -> "));
++    await cleanup();
+   }
+ });
+diff --git a/src/infra/update-check.test.ts b/src/infra/update-check.test.ts
+index 8fe85806ee48ae5e144c7fa40bf5b0fb125299ec..7e82fd1f17b35ecb283c46cb5521761285b07c29 100644
+--- a/src/infra/update-check.test.ts
++++ b/src/infra/update-check.test.ts
+@@ -333,17 +333,99 @@ describe("resolveNpmChannelTag", () => {
+           ),
+         );
+ 
++        const globalConfig = path.join(base, "empty-global-npmrc");
++        const guard = path.join(base, "loopback-only.cjs");
++        await fs.writeFile(globalConfig, "");
++        // This guard runs inside npm, not the parent's MockAgent. Refuse before
++        // connect/DNS, including proxy or redirect destinations outside this fixture.
++        await fs.writeFile(
++          guard,
++          [
++            "const net = require('node:net');",
++            "const connect = net.Socket.prototype.connect;",
++            "net.Socket.prototype.connect = function (...args) {",
++            "  const first = Array.isArray(args[0]) ? args[0][0] : args[0];",
++            "  const options = typeof first === 'object' && first !== null",
++            "    ? first : { port: first, host: typeof args[1] === 'string' ? args[1] : 'localhost' };",
++            "  if (options.path || options.host !== '127.0.0.1' || Number(options.port) !== Number(process.env.OPENCLAW_TEST_NPM_PORT)) {",
++            "    throw new Error('npm fixture refused non-loopback connection');",
++            "  }",
++            "  return connect.apply(this, args);",
++            "};",
++          ].join("\n"),
++        );
++        // Seed case-variant pollution in this test process only; never inspect an
++        // operator npmrc. The real child's sanitized env must override both keys.
++        const inheritedRegistry = "http://127.0.0.1:9/inherited/";
++        vi.stubEnv("npm_config_registry", inheritedRegistry);
++        vi.stubEnv("NPM_CONFIG_REGISTRY", inheritedRegistry);
++        // resolveCommandEnv merges over process.env: omission would reintroduce
++        // inherited config. Tombstones remove both uppercase and lowercase keys.
++        const configKeys = Object.keys(process.env).filter((key) => /^npm_config_/i.test(key));
++        const authKeys = configKeys.filter((key) =>
++          /(?:auth|token|password|username|email|cert|key|otp)/i.test(
++            key.slice("npm_config_".length),
++          ),
++        );
++        expect(authKeys, "Offline npm fixture refuses inherited auth config names").toEqual([]);
++        const controlledConfig = new Set([
++          "registry",
++          "userconfig",
++          "globalconfig",
++          "cache",
++          "update_notifier",
++        ]);
++        // Transport, trust and launch controls stay inherited. If they prevent
++        // this loopback fixture, fail rather than bypassing them.
++        const env: NodeJS.ProcessEnv = Object.fromEntries(
++          configKeys
++            .filter((key) => controlledConfig.has(key.slice("npm_config_".length).toLowerCase()))
++            .map((key) => [key, undefined]),
++        );
++        Object.assign(env, {
++          HOME: home,
++          USERPROFILE: home,
++          NODE_OPTIONS: [process.env.NODE_OPTIONS, "--require=" + JSON.stringify(guard)]
++            .filter(Boolean)
++            .join(" "),
++          OPENCLAW_TEST_NPM_PORT: String(address.port),
++          NPM_CONFIG_USERCONFIG: userConfig,
++          NPM_CONFIG_GLOBALCONFIG: globalConfig,
++          NPM_CONFIG_CACHE: path.join(base, "npm-cache"),
++          NPM_CONFIG_UPDATE_NOTIFIER: "false",
++        });
++        const denied = await runCommandWithTimeout(
++          [process.execPath, "-e", "require('node:net').connect(443, '203.0.113.1')"],
++          { cwd: project, env, timeoutMs: 10_000 },
++        );
++        expect(denied.code).not.toBe(0);
++        expect(denied.stderr).toContain("npm fixture refused non-loopback connection");
++        // Leave registry selection to the user file so --global remains necessary
++        // to ignore project config. No metadata command runs until this readback passes.
++        const polluted = await runCommandWithTimeout(
++          ["npm", "config", "get", "registry", "--global"],
++          {
++            cwd: project,
++            env: { ...env, npm_config_registry: inheritedRegistry },
++            timeoutMs: 10_000,
++          },
++        );
++        expect(polluted.code, polluted.stderr).toBe(0);
++        expect(polluted.stdout.trim()).toBe(inheritedRegistry);
++        const configured = await runCommandWithTimeout(
++          ["npm", "config", "get", "registry", "--global"],
++          { cwd: project, env, timeoutMs: 10_000 },
++        );
++        expect(configured.code, configured.stderr).toBe(0);
++        expect(configured.stdout.trim()).toBe(registry);
++        expect(requests).toHaveLength(0);
+         await expect(
+           fetchNpmPackageTargetStatus({
+             target: "latest",
+             command: "npm",
+             timeoutMs: 10_000,
+             cwd: project,
+-            env: {
+-              ...process.env,
+-              HOME: home,
+-              NPM_CONFIG_USERCONFIG: userConfig,
+-            },
++            env,
+           }),
+         ).resolves.toEqual({
+           version: "2026.6.6",
+@@ -357,6 +439,7 @@ describe("resolveNpmChannelTag", () => {
+           true,
+         );
+       } finally {
++        vi.unstubAllEnvs();
+         await new Promise<void>((resolve, reject) => {
+           server.close((err) => (err ? reject(err) : resolve()));
+         });
+diff --git a/src/infra/widearea-dns.test.ts b/src/infra/widearea-dns.test.ts
+index 8f6950bef38a10f23e731d7de126aa6071d67f49..365359c0493f8b8acf9c27cdd26042c3a268529e 100644
+--- a/src/infra/widearea-dns.test.ts
++++ b/src/infra/widearea-dns.test.ts
+@@ -185,6 +185,8 @@ describe("wide-area DNS zone writes", () => {
+       const previous = "; previous valid zone\n$ORIGIN openclaw.internal.\n";
+       fs.mkdirSync(dnsDir);
+       fs.writeFileSync(zonePath, previous, { mode: 0o640 });
++      fs.chmodSync(zonePath, 0o640);
++      expect(fs.statSync(zonePath).mode & 0o777).toBe(0o640);
+ 
+       try {
+         const moduleUrl = pathToFileURL(path.resolve("src/infra/widearea-dns.ts")).href;
+diff --git a/src/process/supervisor/service-child-relay-host.startup.test.ts b/src/process/supervisor/service-child-relay-host.startup.test.ts
+index a6c8088bdb6ad529c73f5ba4b32ae25320a1d820..ded95f11f61a7bc9ab013607932c6681d7f7df3c 100644
+--- a/src/process/supervisor/service-child-relay-host.startup.test.ts
++++ b/src/process/supervisor/service-child-relay-host.startup.test.ts
+@@ -1,5 +1,6 @@
+ import { isRecord } from "@openclaw/normalization-core/record-coerce";
+ import { afterEach, expect, it, vi } from "vitest";
++import { awaitGateBeforeSettlement, createDeferred } from "../../../test/helpers/promise.js";
+ import { mockProcessPlatform } from "../../test-utils/vitest-spies.js";
+ import { firstMockArg } from "./adapters/child.test-support.js";
+ import { encodeServiceChildMessage } from "./service-child-protocol.js";
+@@ -86,3 +87,161 @@ it("joins failed POSIX startup cleanup before returning the original executable
+     adapter.dispose();
+   }
+ });
++
++it.each([
++  "before-launch",
++  "undefined-refusal",
++  "after-launch",
++  "transport-failure",
++  "cancel-failure",
++] as const)("preserves the cleanup outcome for deferred launch failure: %s", async (failure) => {
++  mockProcessPlatform("darwin");
++  const stub = createWritableRelayChild();
++  mocks.spawn.mockReturnValue(stub.child);
++  vi.spyOn(process, "kill").mockImplementation(() => {
++    throw Object.assign(new Error("process group is gone"), { code: "ESRCH" });
++  });
++  const refusal =
++    failure === "undefined-refusal" ? undefined : new Error("synthetic launch policy refused");
++  const cancelSent = createDeferred();
++  const startupAcknowledged = createDeferred();
++  const closingAcknowledged = createDeferred();
++  const frames: string[] = [];
++  vi.spyOn(stub.control, "_write").mockImplementation((chunk, _encoding, callback) => {
++    const message: unknown = JSON.parse(String(chunk));
++    if (!isRecord(message) || typeof message.type !== "string") {
++      throw new Error("Expected a control frame");
++    }
++    frames.push(message.type);
++    if (message.type === "cancel") {
++      cancelSent.resolve();
++      if (failure === "cancel-failure") {
++        callback(new Error("synthetic cancel transport failure"));
++        return;
++      }
++    }
++    if (message.type === "startup-error-ack") {
++      startupAcknowledged.resolve();
++    }
++    if (message.type === "closing-ack") {
++      closingAcknowledged.resolve();
++    }
++    if (message.type === "launch" && failure === "transport-failure") {
++      callback(new Error("synthetic launch transport failure"));
++      return;
++    }
++    callback();
++  });
++  const { adapter, ready } = await createServiceChildRelayAdapter({
++    command: "/synthetic-command",
++    args: [],
++    stdinMode: "pipe-closed",
++    oomScoreWrapperSelected: false,
++    initiateSpawn: (launch) => {
++      if (failure === "transport-failure") {
++        return launch();
++      }
++      if (failure === "after-launch") {
++        launch();
++      }
++      // oxlint-disable-next-line typescript/only-throw-error -- Exercise an undefined refusal at the real launch boundary.
++      throw refusal;
++    },
++  });
++  const result = ready.then(
++    () => ({ status: "fulfilled" as const }),
++    (error: unknown) => ({ status: "rejected" as const, error }),
++  );
++  let readinessSettled = false;
++  void result.then(() => {
++    readinessSettled = true;
++  });
++  const cleanup = adapter.waitForExtinction();
++  void cleanup.catch(() => undefined);
++  const start = firstMockArg(stub.sendMock, "service start");
++  if (!isRecord(start) || typeof start.generation !== "string") {
++    throw new Error("Expected the admitted service generation");
++  }
++  const generation = start.generation;
++  let cleanupSettled = false;
++  void cleanup.then(
++    () => {
++      cleanupSettled = true;
++    },
++    () => {
++      cleanupSettled = true;
++    },
++  );
++  try {
++    stub.control.push(encodeServiceChildMessage({ type: "prepared", generation, sequence: 1 }));
++    if (failure === "before-launch" || failure === "undefined-refusal") {
++      await awaitGateBeforeSettlement(cancelSent.promise, result, "refusal lost cleanup custody");
++      expect(frames).toEqual(["cancel"]);
++      expect(cleanupSettled).toBe(false);
++      expect(readinessSettled).toBe(false);
++      stub.control.push(encodeServiceChildMessage({ type: "prepared", generation, sequence: 2 }));
++      stub.control.push(
++        encodeServiceChildMessage({
++          type: "startup-error",
++          generation,
++          sequence: 3,
++          anchorPid: 1235,
++          error: "command startup cancelled before spawn",
++        }),
++      );
++      await awaitGateBeforeSettlement(
++        startupAcknowledged.promise,
++        result,
++        "cleanup skipped receipt",
++      );
++      expect(cleanupSettled).toBe(false);
++      stub.control.push(
++        encodeServiceChildMessage({
++          type: "closing",
++          reason: "cancel",
++          generation,
++          sequence: 4,
++        }),
++      );
++      await awaitGateBeforeSettlement(
++        closingAcknowledged.promise,
++        result,
++        "cleanup skipped extinction",
++      );
++      expect(cleanupSettled).toBe(false);
++      expect(readinessSettled).toBe(false);
++      stub.control.push(null);
++      stub.stdout.end();
++      stub.stderr.end();
++      stub.lineage.end();
++      stub.disconnectMock();
++      stub.emitExit(0);
++      const outcome = await result;
++      expect(outcome.status).toBe("rejected");
++      if (outcome.status !== "rejected") {
++        throw new Error("Refused launch reported startup success");
++      }
++      if (failure === "undefined-refusal") {
++        expect(outcome.error).toMatchObject({ message: "service child launch admission refused" });
++      } else {
++        expect(outcome.error).toBe(refusal);
++      }
++      await expect(cleanup).resolves.toBeUndefined();
++      expect(frames).toEqual(["cancel", "startup-error-ack", "closing-ack"]);
++    } else {
++      expect(await result).toMatchObject({ status: "rejected", error: expect.any(Error) });
++      await expect(cleanup).rejects.toThrow("service child cleanup identity lost");
++      expect(frames).toEqual([failure === "cancel-failure" ? "cancel" : "launch"]);
++    }
++  } finally {
++    stub.control.destroy();
++    stub.lineage.destroy();
++    stub.stdout.end();
++    stub.stderr.end();
++    stub.disconnectMock();
++    stub.emitExit(0);
++    await result;
++    await cleanup.catch(() => undefined);
++    adapter.dispose();
++  }
++});
+diff --git a/src/process/supervisor/service-child-relay-host.test.ts b/src/process/supervisor/service-child-relay-host.test.ts
+index 9dbc493107463cbfd5781c876d625162de0f3ee1..62ceb63c5848e1a9d3dc96a9ada8ab0475ded91c 100644
+--- a/src/process/supervisor/service-child-relay-host.test.ts
++++ b/src/process/supervisor/service-child-relay-host.test.ts
+@@ -117,6 +117,13 @@ it.each(["current", "revoked"] as const)(
+     const stub = createWritableRelayChild();
+     mocks.spawn.mockReturnValue(stub.child);
+     const writes = vi.spyOn(stub.control, "write");
++    const cancellationReached = createDeferredCore();
++    vi.spyOn(stub.control, "_write").mockImplementation((chunk, _encoding, callback) => {
++      if (String(chunk).includes('"type":"cancel"')) {
++        cancellationReached.resolve();
++      }
++      callback();
++    });
+     const grantReached = createDeferredCore();
+     let current = true;
+     let released = false;
+@@ -153,6 +160,25 @@ it.each(["current", "revoked"] as const)(
+     expect(released).toBe(false);
+     try {
+       if (rejected) {
++        await cancellationReached.promise;
++        vi.spyOn(process, "kill").mockImplementation(() => {
++          throw Object.assign(new Error("process group is gone"), { code: "ESRCH" });
++        });
++        emit(
++          {
++            type: "startup-error",
++            anchorPid: 1235,
++            error: "command startup cancelled before spawn",
++          },
++          2,
++        );
++        emit({ type: "closing", reason: "cancel" }, 3);
++        stub.control.push(null);
++        stub.lineage.end();
++        stub.stdout.end();
++        stub.stderr.end();
++        stub.disconnectMock();
++        stub.emitExit(0);
+         await rejected;
+         expect(writes.mock.calls.some(([chunk]) => String(chunk).includes('"type":"launch"'))).toBe(
+           false,
+diff --git a/src/process/supervisor/service-child-relay-host.ts b/src/process/supervisor/service-child-relay-host.ts
+index 78916e7d113bc6df5a60d42e7189f3ad6cc7098f..11e7434104f10247376b4f4c54e6130d3efd794a 100644
+--- a/src/process/supervisor/service-child-relay-host.ts
++++ b/src/process/supervisor/service-child-relay-host.ts
+@@ -389,9 +389,35 @@ export async function createServiceChildRelayAdapter(
+     }
+     inboundSequence = message.sequence;
+     if (message.type === "prepared" && state === "starting" && params.initiateSpawn) {
+-      void sendControlMessage({ type: "launch" }, params.initiateSpawn).catch((error: unknown) =>
+-        loseIdentity(String(error)),
+-      );
++      const initiate = params.initiateSpawn;
++      let refusal: { error: unknown } | undefined;
++      void sendControlMessage({ type: "launch" }, (launch, settlement) => {
++        let launched = false;
++        try {
++          return initiate(() => {
++            launched = true;
++            return launch();
++          }, settlement);
++        } catch (error) {
++          if (!launched) {
++            refusal = { error };
++          }
++          throw error;
++        }
++      }).catch((error: unknown) => {
++        if (!refusal || useWindowsJobAnchor) {
++          loseIdentity(String(error));
++          return;
++        }
++        // A refused launch sent no command frame. Retain the prepared POSIX
++        // anchor until its cancellation receipt and native extinction are joined.
++        state = "closing";
++        cleanupDeadline.begin();
++        startup.reject(toErrorObject(refusal.error, "service child launch admission refused"));
++        void sendControlMessage({ type: "cancel", signal: "SIGKILL" }).catch(
++          (cancelError: unknown) => loseIdentity(String(cancelError)),
++        );
++      });
+     } else if (message.type === "ready" && state === "starting") {
+       // Ready is not construction-complete: secret delivery can still be
+       // blocked. Keep abort protection until the adapter returns.
+diff --git a/src/state/openclaw-state-db-read-connection.ts b/src/state/openclaw-state-db-read-connection.ts
+index da13d2d506de469c1b748ad409e2ac9631d21924..39a1183d58a025a1fa31aae48ef1d0d741ab03bb 100644
+--- a/src/state/openclaw-state-db-read-connection.ts
++++ b/src/state/openclaw-state-db-read-connection.ts
+@@ -154,12 +154,25 @@ export function prepareOpenClawStateDirectReader(context: OpenClawStateWorkerCon
+     openClawStateDatabaseCache.assertOpenClawStateDatabaseOpenAllowed(pathname, "cached-read");
+     assertExistingDatabaseIdentity(pathname, identity.key, identity.birthtime);
+     const integrity = context.stateIntegrity;
+-    if (
+-      (integrity && Atomics.load(new BigInt64Array(integrity.revision), 0) !== integrity.epoch) ||
+-      (context.existingSchemaPath !== undefined &&
+-        (!integrity || Atomics.load(new BigInt64Array(integrity.proof), 0) === -1n))
+-    ) {
+-      throw new Error("Direct shared-state reader requires current integrity admission");
++    if (integrity) {
++      const observedRevision = Atomics.load(new BigInt64Array(integrity.revision), 0);
++      if (observedRevision !== integrity.epoch) {
++        throw new Error(
++          `Direct shared-state reader requires current integrity admission: revision mismatch (capturedEpoch=${integrity.epoch}, observedRevision=${observedRevision})`,
++        );
++      }
++    }
++    if (context.existingSchemaPath !== undefined) {
++      if (!integrity) {
++        throw new Error(
++          "Direct shared-state reader requires current integrity admission: missing integrity context",
++        );
++      }
++      if (Atomics.load(new BigInt64Array(integrity.proof), 0) === -1n) {
++        throw new Error(
++          "Direct shared-state reader requires current integrity admission: proof unavailable",
++        );
++      }
+     }
+   };
+   const inContext = <T>(operation: () => T): T => {
+diff --git a/test/vitest/vitest.agents-paths.mjs b/test/vitest/vitest.agents-paths.mjs
+index 96c6fd56a97ecc6c2243178fb363e7eca30e34c9..06dd843d52f152d0f77b4f9b5a77aa04a90092b8 100644
+--- a/test/vitest/vitest.agents-paths.mjs
++++ b/test/vitest/vitest.agents-paths.mjs
+@@ -6,6 +6,7 @@ const agentsRoot = "src/agents";
+ const embeddedRoot = `${agentsRoot}/embedded-agent-runner`;
+ const spawnProductionBoundaryFiles = [
+   "src/agents/subagents/spawn/subagent-spawn.production-boundary.test.ts",
++  "src/agents/subagents/announce/subagent-announce.requester-settle-admission.test.ts",
+ ];
+ 
+ // These suites mock shared runtime, network, or plugin modules and cannot
+diff --git a/test/vitest/vitest.database-worker-core-paths.mjs b/test/vitest/vitest.database-worker-core-paths.mjs
+index 232c9ead1e2abcba079f14c89e63a0e318c71ac4..d5b5bb4c3c3121574911d8a75d2d69f570b52d30 100644
+--- a/test/vitest/vitest.database-worker-core-paths.mjs
++++ b/test/vitest/vitest.database-worker-core-paths.mjs
+@@ -84,6 +84,7 @@ export const databaseWorkerCoreTestFiles = [
+   "src/agents/agent-command.live-model-switch.test.ts",
+   "src/agents/agent-command.embedded-maintenance.test.ts",
+   "src/agents/agent-command.restart-settlement.test.ts",
++  "src/agents/agent-command.peer-followup.test.ts",
+   "src/agents/internal-session-effects.test.ts",
+   "src/agents/live-model-switch.worker.test.ts",
+   "src/agents/tools/sessions-tool.test.ts",

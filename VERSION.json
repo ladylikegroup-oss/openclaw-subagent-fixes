@@ -1,0 +1,134 @@
+{
+  "package_version": "2026.10.5-fix.1",
+  "upstream": "https://github.com/openclaw/openclaw",
+  "upstream_version": "2026.10.5",
+  "upstream_tag": "v2026.10.5",
+  "upstream_base_commit": "1b58cb9a1b4f4353e1add63c8506db4d890962e8",
+  "original_fixed_source_commit": "a02d409a4c751ecd83239ed71aae948d1c868bcd",
+  "original_fixed_source_tree": "97d7daf598162ecefe68847f2eb11122171979d4",
+  "upstream_base_tree": "a138559698570e238395121723a773106ac33f8c",
+  "patch_file": "openclaw-2026.10.5-subagent-fixes.patch",
+  "patch_sha256": "0d11d93db220c4cd14d351d4d30124a7c89d12ed0faaa84673d6701f47f238d7",
+  "original_source_commits": [
+    {
+      "source_commit": "78a7c5e7a79d2ff0075834a5974dd8eef9752afd",
+      "subject": "fix: distinguish shared-state integrity admission failures"
+    },
+    {
+      "source_commit": "f63cbe59171925c4545d3f8c4faf9138e82a5695",
+      "subject": "fix(agents): wait for reply owner before peer followup claim"
+    },
+    {
+      "source_commit": "7d0fd6707c9f46c142e09c14b396898927953229",
+      "subject": "fix(process): retain cleanup custody after refused launch"
+    },
+    {
+      "source_commit": "8c9cb5c65fb26091b43e1c56aba729f7dda8014e",
+      "subject": "fix(agents): bound new requester wake identities without replaying legacy input"
+    },
+    {
+      "source_commit": "f8863e7e3e3a7a26d83a97f706fd1421fb79544c",
+      "subject": "test(agents): observe reply release before recovery claims"
+    },
+    {
+      "source_commit": "a02d409a4c751ecd83239ed71aae948d1c868bcd",
+      "subject": "test: isolate metadata and filesystem recovery fixtures"
+    }
+  ],
+  "changed_files": [
+    {
+      "path": "src/agents/agent-command-recovery-owner.ts",
+      "patched_sha256": "d2849446d5c3eb9f0f87e1d9202b6aefb397bd048717d4ef4b66c35a2d1736bf"
+    },
+    {
+      "path": "src/agents/agent-command.peer-followup.test.ts",
+      "patched_sha256": "a897ad91e9d8cb3ed6398862f948627548ac587de8f452735f9a53272ca87446"
+    },
+    {
+      "path": "src/agents/bash-tools.exec-authorization.integration.test.ts",
+      "patched_sha256": "fa27127b5ab6598b4439a70be717b7f4e2aa771269c05fd0016c6ceab1de74c1"
+    },
+    {
+      "path": "src/agents/subagents/announce/subagent-announce.requester-settle-admission.test.ts",
+      "patched_sha256": "651188139acae61c342357eaba45dc3b11c41a1c1a1eceba6094741e541834a7"
+    },
+    {
+      "path": "src/agents/subagents/announce/subagent-announce.requester-settle-results.test.ts",
+      "patched_sha256": "f9c1a15d3d9e2a417db781bd4dfc17b7e8b38821f989b0618a1cd79393de93d5"
+    },
+    {
+      "path": "src/agents/subagents/announce/subagent-announce.requester-settle-state.ts",
+      "patched_sha256": "d03618d23fcfda46de25f097ad18b8ef5fbabe219e556a5efc5ddb3efe6835ec"
+    },
+    {
+      "path": "src/agents/subagents/announce/subagent-announce.requester-settle-wake.test.ts",
+      "patched_sha256": "a806a5398eb2099e18eb5cebab1ee73e10b1f54470ec8f4457a5e596d640cfde"
+    },
+    {
+      "path": "src/agents/subagents/announce/subagent-announce.requester-settle-wake.ts",
+      "patched_sha256": "101a3a1691f87dc7da285e8b38fde2dad2881446827cc3d6c8908774d4f282d6"
+    },
+    {
+      "path": "src/agents/subagents/registry/subagent-registry.types.ts",
+      "patched_sha256": "5a395e443f3c03665c627d2a2ff63d32a84b9e2f0368a41be27b60818e3d9951"
+    },
+    {
+      "path": "src/agents/subagents/registry/subagent-requester-settle-identity.test.ts",
+      "patched_sha256": "28c37c506b4f2d402c81fcb2e4c844f87607e7b1c55b8525aafde4b2de095ba8"
+    },
+    {
+      "path": "src/agents/subagents/registry/subagent-requester-settle-identity.ts",
+      "patched_sha256": "0fb4c533e87370bb47db98aefbab91cc0b6f6abf8a8b4f4acf47829ce88f8213"
+    },
+    {
+      "path": "src/agents/worktrees/service.apfs.test.ts",
+      "patched_sha256": "c70902f847de79c9a8a7e8bd823d0db8fe44756d30280e9f78eac43c12ca84b4"
+    },
+    {
+      "path": "src/auto-reply/reply/reply-turn-admission.recovery.test.ts",
+      "patched_sha256": "65c7c414aedb87c2394cafb91cd4de8f91f60918519119c0d28bdf52a4cb357e"
+    },
+    {
+      "path": "src/infra/exec-approvals-schema-admission.test.ts",
+      "patched_sha256": "d0b4c351ed1c80fe5a1562bcdd43823f557e3aeac98420050c5d21ce76fb24c2"
+    },
+    {
+      "path": "src/infra/git-exec.settled.test.ts",
+      "patched_sha256": "4bc9d831577b735a55fef2061413fbf35661870be291a9f2c1df91eafdcee992"
+    },
+    {
+      "path": "src/infra/update-check.test.ts",
+      "patched_sha256": "4adda1c0a840c627032b2596dd9d999b4d265e544bd2be782afc67e32588a5ca"
+    },
+    {
+      "path": "src/infra/widearea-dns.test.ts",
+      "patched_sha256": "2005217f5523b46c9fae60c7ef11c4170793113e49e2beb12a0db13d0fb5aedc"
+    },
+    {
+      "path": "src/process/supervisor/service-child-relay-host.startup.test.ts",
+      "patched_sha256": "a2dbaa235c1b788ef141e08d69261337df5d04e311d0dd3249a44e1ed121da76"
+    },
+    {
+      "path": "src/process/supervisor/service-child-relay-host.test.ts",
+      "patched_sha256": "b0af60820be36019b889efbe7ef8d9f82d8e1ba262262ffc9e93ff6199b9b853"
+    },
+    {
+      "path": "src/process/supervisor/service-child-relay-host.ts",
+      "patched_sha256": "ed4d9cb79302059c3f6f3ad033acae5cce2f5d3cac169715103abcdcce203395"
+    },
+    {
+      "path": "src/state/openclaw-state-db-read-connection.ts",
+      "patched_sha256": "80ac5718f0267f1e084c5293eb4d6e1c8f1393e29fa5b9027342d1a65c197af6"
+    },
+    {
+      "path": "test/vitest/vitest.agents-paths.mjs",
+      "patched_sha256": "c52b4d9a4bb50ea083dff5ebb0c3bf240372050c496af44c277efa738ef932ef"
+    },
+    {
+      "path": "test/vitest/vitest.database-worker-core-paths.mjs",
+      "patched_sha256": "01ef325c55ea4eaa63f20c8fa84ada31287b87a9deee3c62affefb521a088cfd"
+    }
+  ],
+  "other_versions": "not verified",
+  "official_upstream_release": false
+}
